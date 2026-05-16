@@ -134,7 +134,7 @@ Documentation-first rule: search `aws-docs` and `strands-agents` before writing 
 ## Project Layout
 
 ```
-GS-Technical-Case-Study/
+grayscale-project/
   pyproject.toml           # Project metadata + dependencies (uv-managed)
   uv.lock                  # Locked dependency versions (committed)
   code/

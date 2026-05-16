@@ -3,7 +3,7 @@
 ## Current Layout
 
 ```
-GS-Technical-Case-Study/
+grayscale-project/
   Instructions.md              # Assessment brief and deliverable requirements
   securities_reference.csv     # Canonical security master (20 equities)
   custodian_a.csv              # EOD positions from Custodian A (ticker-based)
@@ -13,7 +13,7 @@ GS-Technical-Case-Study/
 ## Expected Final Layout
 
 ```
-GS-Technical-Case-Study/
+grayscale-project/
   Instructions.md
   README.md                    # Primary deliverable: writeup, architecture, analysis
   pyproject.toml               # Project metadata + deps (managed by uv)
@@ -39,10 +39,10 @@ GS-Technical-Case-Study/
 
 ## Conventions
 
-- All written analysis goes in `README.md` at the root of `GS-Technical-Case-Study/` — not scattered across multiple docs
+- All written analysis goes in `README.md` at the repository root — not scattered across multiple docs
 - Diagrams go in `img/` as image files (PNG or SVG preferred)
 - Code goes in `code/` (or `src/`) — do not place scripts at the repo root
-- Input data files (`*.csv`) stay at the `GS-Technical-Case-Study/` root; do not move or rename them
+- Input data files (`*.csv`) stay at the repository root; do not move or rename them
 - No database files, `.env` files, or credentials should be committed
 
 ## Key File Roles

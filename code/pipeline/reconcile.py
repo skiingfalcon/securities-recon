@@ -72,7 +72,7 @@ def _build_warning_index(
         warnings: Flat list of all IngestWarning records from both custodians.
 
     Returns:
-        A dict mapping (source_file, row_index) → list of warnings.
+        A dict mapping (source_file, row_index) ? list of warnings.
     """
     index: dict[tuple[str, int], list[IngestWarning]] = defaultdict(list)
     for w in warnings:
@@ -121,12 +121,12 @@ def reconcile(
        (grouped by security_id).
     3. Emit identifier_ambiguous breaks for ambiguous positions.
     4. For each resolved group, compare the two custodian sides:
-       - One-sided → missing_at_custodian
-       - Both present, type mismatch → position_type_mismatch (with
+       - One-sided ? missing_at_custodian
+       - Both present, type mismatch ? position_type_mismatch (with
          quantity fields also populated so the delta is not lost)
-       - Both present, quantity mismatch → quantity_mismatch
-       - Both present, value mismatch → value_mismatch
-       - Both present, no mismatch → no break
+       - Both present, quantity mismatch ? quantity_mismatch
+       - Both present, value mismatch ? value_mismatch
+       - Both present, no mismatch ? no break
     5. book_quantity, book_market_value, position_type_book are always
        None because no book of record is available in this case study.
 
@@ -161,7 +161,7 @@ def reconcile(
     # ambiguous: list of (position, match) where match.security_id is None
     ambiguous: list[tuple[Position, object]] = []
 
-    # resolved: security_id → {"custodian_a": Position | None, "custodian_b": Position | None}
+    # resolved: security_id ? {"custodian_a": Position | None, "custodian_b": Position | None}
     # We use a dict-of-dicts so the join step is a simple key lookup.
     resolved: dict[str, dict[str, Position | None]] = defaultdict(
         lambda: {"custodian_a": None, "custodian_b": None}
@@ -373,7 +373,7 @@ def reconcile(
 
 
 # ---------------------------------------------------------------------------
-# Phase 5  OutputArtifact envelope helpers (design.md �5.D)
+# Phase 5 — OutputArtifact envelope helpers (design.md §5.D)
 # ---------------------------------------------------------------------------
 
 
@@ -423,7 +423,7 @@ def write_envelope(
 
     Every JSON artifact in ``out/`` shares the same ``{metadata, data}``
     shape so reviewers can verify provenance (input hashes, commit, as-of)
-    without reading the data block. See design.md �5.D and Req 5 AC 1, 2.
+    without reading the data block. See design.md §5.D and Req 5 AC 1, 2.
     """
     envelope = OutputArtifact(
         metadata=metadata,
@@ -435,7 +435,7 @@ def write_envelope(
 
 
 # ---------------------------------------------------------------------------
-# Phase 6  Run summary printer (Req 4 AC 1, 4)
+# Phase 6 — Run summary printer (Req 4 AC 1, 4)
 # ---------------------------------------------------------------------------
 
 
@@ -508,7 +508,7 @@ def print_run_summary(breaks: list[Break], runtime_seconds: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 6  Layer-1 entrypoint (Req 4 AC 1, 4, 5; Req 5 AC 4; Req 6 AC 2)
+# Phase 6 — Layer-1 entrypoint (Req 4 AC 1, 4, 5; Req 5 AC 4; Req 6 AC 2)
 # ---------------------------------------------------------------------------
 
 
@@ -578,7 +578,7 @@ def run_layer1(
 
 if __name__ == "__main__":
     # Resolve the project root by walking up from this file. The layout is:
-    #   GS-Technical-Case-Study/code/pipeline/reconcile.py  (this file)
-    #   GS-Technical-Case-Study/                            (the project root)
+    #   code/pipeline/reconcile.py  (this file)
+    #   <repo-root>/                 (the project root)
     project_root = Path(__file__).resolve().parent.parent.parent
     run_layer1(project_root)

@@ -48,7 +48,7 @@ Run output backs every number below. Counts come from [out/data_quality.json](ou
 ### Data quality / formatting
 
 - **Date year discrepancy is real and unanimous.** The brief says positions are EOD for Jan 2, **2026**, but every row in both custodian files shows year **2025**. The ingest layer preserves source truth (the parsed date stays 2025) and emits a `year_mismatch` warning for each row. **20 such warnings** are present  every single row, both custodians. Either the brief has a typo or it is a deliberate signal; either way the pipeline never silently rewrites the year.
-- **Custodian B encodes shorts as parenthesized negatives.** NVDA, BRK.A market values and shares show `(5000)`, `(4250000)`, `(10)`, `(6500000)`. The ingest layer coerces these to signed integers and emits **4 `paren_negative_coerced` warnings** (2 rows ◊ 2 numeric fields).
+- **Custodian B encodes shorts as parenthesized negatives.** NVDA, BRK.A market values and shares show `(5000)`, `(4250000)`, `(10)`, `(6500000)`. The ingest layer coerces these to signed integers and emits **4 `paren_negative_coerced` warnings** (2 rows ù 2 numeric fields).
 - **Custodian B mixes four date formats.** `01/02/2025`, `1/2/25`, `2025-01-02`, `02-JAN-2025`  all present in a 10-row file. The ingest layer accepts every variant and emits **19 `non_iso_date_coerced` warnings**, one per non-ISO row across both custodians.
 - **`BRK.A`'s period must be preserved.** Stripping the dot turns the ticker into `BRKA`, which has no master entry  that would silently produce a `missing_at_custodian` break for the wrong reason. The ingest layer emits a **`ticker_dot_preserved` warning** for the row and keeps the period verbatim. There is exactly 1 such warning, which is correct for this fixture.
 - **Custodian A's column is mis-named.** `trade_date` for an EOD position file is really an `as_of_date`. The pipeline labels it correctly in the `Position` model regardless.
@@ -123,7 +123,7 @@ flowchart LR
     end
 ```
 
-**Industry break-cause mix, to anchor the ß11 eval bar and ß10 cost math.** The numbers below are typical for asset managers processing 15-50k positions daily at 0.1-0.5% break rates (source: [Finantrix daily-recon reference](https://www.finantrix.com/articles/how-to-reconcile-custodian-vs-internal-positions-daily)):
+**Industry break-cause mix, to anchor the ù11 eval bar and ù10 cost math.** The numbers below are typical for asset managers processing 15-50k positions daily at 0.1-0.5% break rates (source: [Finantrix daily-recon reference](https://www.finantrix.com/articles/how-to-reconcile-custodian-vs-internal-positions-daily)):
 
 | Root cause | Industry typical share |
 |---|---|
@@ -133,7 +133,7 @@ flowchart LR
 | Security master issues | ~10% |
 | System / data feed errors | ~5% |
 
-The ß11 per-`break_type` precision bar should ratchet most aggressively against the settlement-timing and corporate-actions categories  auto-clearing 80% of the 40% settlement-timing slice is a bigger ops-time win than auto-clearing 100% of the 5% system-errors slice. The mocked `get_recent_trades` and `lookup_corporate_actions` tools in [code/tools/](code/tools/) are scoped to exactly those top-two categories for precisely this reason.
+The ù11 per-`break_type` precision bar should ratchet most aggressively against the settlement-timing and corporate-actions categories  auto-clearing 80% of the 40% settlement-timing slice is a bigger ops-time win than auto-clearing 100% of the 5% system-errors slice. The mocked `get_recent_trades` and `lookup_corporate_actions` tools in [code/tools/](code/tools/) are scoped to exactly those top-two categories for precisely this reason.
 
 **Why the schema scales without a rewrite.** The `Break` model in the dump below already has `book_quantity`, `book_market_value`, and `position_type_book` declared as nullable. Adding an OMS feed populates those fields and the Reconciler grows from a two-side comparison to a three-side comparison  no schema migration, no `OutputArtifact` envelope change, no test rewrites. The Layer 1 firewall and the existing `{metadata, data}` envelope stay intact; the only new code is an `ingest_oms()` helper in [code/pipeline/ingest.py](code/pipeline/ingest.py) and one branch in [code/pipeline/reconcile.py](code/pipeline/reconcile.py) that compares each custodian side against the OMS first, then against the other custodian as a cross-check.
 
@@ -204,8 +204,8 @@ This single record shows the dual `position_type_*` + `quantity_*` population, t
 
 `code/tools/securities.py:IdentifierResolver` builds two indexes from the master once per run: a lowercase **dot-preserving** ticker map and a `rapidfuzz` WRatio index over lowercase names. Resolution is a three-branch algorithm:
 
-1. **Exact ticker** (Custodian A): `BRK.A` í lowercased to `brk.a` í SEC0009. Dot survives because the security master is keyed on it.
-2. **Fuzzy name** (Custodian B): `"Apple Inc Common Stock"` í WRatio against the master í SEC0001 if top confidence e `FUZZY_THRESHOLD = 0.85`.
+1. **Exact ticker** (Custodian A): `BRK.A` ù lowercased to `brk.a` ù SEC0009. Dot survives because the security master is keyed on it.
+2. **Fuzzy name** (Custodian B): `"Apple Inc Common Stock"` ù WRatio against the master ù SEC0001 if top confidence e `FUZZY_THRESHOLD = 0.85`.
 3. **Ambiguous** when the top two candidates are within `AMBIGUITY_EPSILON = 0.05`. The resolver returns `security_id=None` and both candidates as `alternatives`. The Reconciler then emits `identifier_ambiguous`  a Break that a human or the Layer-2 agent can disambiguate.
 
 The same `IdentifierResolver` is wrapped as the `lookup_security` `@tool` for the agent, so Layer 1 and Layer 2 always agree on the master.
@@ -228,7 +228,7 @@ Three layers. Only the first two ship in this repo; the third is roadmap.
 
 ```mermaid
 flowchart TB
-    subgraph Inputs[Inputs - GS-Technical-Case-Study/]
+    subgraph Inputs[Inputs]
         CSV_A[custodian_a.csv]
         CSV_B[custodian_b.csv]
         CSV_M[securities_reference.csv]
@@ -305,19 +305,19 @@ Layer 2 unavailable (NoCredentialsError: Unable to locate credentials); running 
 
 ### Expected verdict distribution (Layer 2 against this dataset)
 
-The mocked tool data plus the ß11 auto-clear policy produce a real triage outcome rather than "everything escalates":
+The mocked tool data plus the ù11 auto-clear policy produce a real triage outcome rather than "everything escalates":
 
 | Verdict | Count | Securities |
 |---|---|---|
 | `auto_clear` | 4-5 | AAPL, MSFT, AMZN, V, TSLA (clean settlement-timing stories) |
 | `investigate` | 2-3 | META (corp-action + custodian gap), MA, SHOP (transfer-in stories ops should eyeball once) |
-| `escalate` | 6-8 | NVDA (position-type flip, never auto-clearable per ß11), BRK.A (B-side ambiguous), GOOGL (no plausible evidence), JPM (judgement call on the short), BAC (merger needs human), 2 identifier_ambiguous rows |
+| `escalate` | 6-8 | NVDA (position-type flip, never auto-clearable per ù11), BRK.A (B-side ambiguous), GOOGL (no plausible evidence), JPM (judgement call on the short), BAC (merger needs human), 2 identifier_ambiguous rows |
 
 Exact split depends on what Claude decides on each run; the *shape* is what changed from a prior "everything escalates" behavior (the verdict-capture bug in `_extract_classification` is fixed; see `_default_escalate` in [code/agent.py](code/agent.py) for the safety fallback). `out/resolved_breaks.json` and `out/escalations.json` are the source of truth.
 
 ### Layer 3  production architecture (roadmap, defended)
 
-The ß9 phased roadmap names the production stack at a glance. This subsection defends each service choice the way I'd defend it in a design review.
+The ù9 phased roadmap names the production stack at a glance. This subsection defends each service choice the way I'd defend it in a design review.
 
 **Orchestration  Step Functions over EventBridge Scheduler + Lambda or Airflow.** The daily run is a deterministic DAG with a small number of well-named states (`ingest_a`, `ingest_b`, `reconcile`, `write_layer1_artifacts`, `agent_per_break`, `write_layer2_artifacts`, `notify`). Step Functions wins on three axes: the state-machine diagram doubles as the operational runbook (an ops engineer on-call at 7:45am with a failing run reads the visual execution, not a Lambda log soup); per-state retry semantics with exponential backoff are a configuration, not code; and per-transition pricing keeps the cost ceiling visible (a daily run with ~50 transitions is cents, predictable, alarmable). The acknowledged trade-off is cold-start latency on the first transition of the day  measured in low single-digit seconds, irrelevant against a multi-minute SLA. Airflow was rejected as over-engineered for a single daily DAG with no cross-DAG dependencies; EventBridge Scheduler + raw Lambda was rejected because per-state visibility collapses into "find the right log group" the moment something fails partway through.
 
@@ -327,13 +327,13 @@ The ß9 phased roadmap names the production stack at a glance. This subsection de
 
 **Observability and the cost ceiling  three metrics that earn their alarm, not "best-effort logging."** Production publishes exactly three CloudWatch custom metrics per run, and each one has a wired alarm: (1) `break_count_by_type`  alarms on a step-change vs. the trailing 30-day median per type, because a 10x spike in `missing_at_custodian` on a Tuesday morning is the leading indicator of a custodian outage; (2) `tokens_per_run` rolled up to `estimated_cost_usd` per day, with a hard per-day dollar ceiling that pages ops if exceeded  the cost-reporter math in `code/run.py` is the source of truth here, not a hand-built dashboard; (3) `agent_p95_latency_ms` per `break_type`, because a slow agent is a leading indicator of a model regression or a tool-call timeout. CloudWatch is the operational surface; Langfuse runs alongside as the LLM-specific tracing layer (prompt diff replay across releases, per-tool token attribution). The two are complements, not duplicates  CloudWatch alarms wake the on-call; Langfuse explains *why* after the fact.
 
-**Identity, secrets, network  least-privilege per state, never per pipeline.** Each Step Functions state has its own IAM role. The `ingest_a` state can read its custodian's S3 prefix and write to the raw-positions DynamoDB table; it *cannot* write to the resolved-breaks table or call Bedrock. The `agent_per_break` state can read the raw-breaks table and call Bedrock + the OMS / corp-actions PrivateLink endpoints; it *cannot* read the raw custodian archive (no business reason) and *cannot* write to the auto-clear ledger (that's a separate state with a separate role enforcing the ß11 thresholds). Custodian SFTP credentials and any OMS API tokens live in Secrets Manager with rotation lambdas; nothing ships in environment variables. All Bedrock traffic uses a VPC endpoint so prompts containing real position data never traverse the public internet; all internal tool calls (`get_recent_trades`, `lookup_corporate_actions`) go over PrivateLink to the OMS and corp-actions services. The blast radius of any single compromised state's credentials is therefore exactly the data that state legitimately touches.
+**Identity, secrets, network  least-privilege per state, never per pipeline.** Each Step Functions state has its own IAM role. The `ingest_a` state can read its custodian's S3 prefix and write to the raw-positions DynamoDB table; it *cannot* write to the resolved-breaks table or call Bedrock. The `agent_per_break` state can read the raw-breaks table and call Bedrock + the OMS / corp-actions PrivateLink endpoints; it *cannot* read the raw custodian archive (no business reason) and *cannot* write to the auto-clear ledger (that's a separate state with a separate role enforcing the ù11 thresholds). Custodian SFTP credentials and any OMS API tokens live in Secrets Manager with rotation lambdas; nothing ships in environment variables. All Bedrock traffic uses a VPC endpoint so prompts containing real position data never traverse the public internet; all internal tool calls (`get_recent_trades`, `lookup_corporate_actions`) go over PrivateLink to the OMS and corp-actions services. The blast radius of any single compromised state's credentials is therefore exactly the data that state legitimately touches.
 
 **Multi-region and DR  primary `us-west-2`, warm-but-honest in `us-east-1`.** Bedrock is regional and model availability differs by region, so the failover stance has to be explicit. Primary in `us-west-2` with cross-region replication for the durable layer: S3 CRR to `us-east-1`, DynamoDB Global Tables for the break ledger, AgentCore prompt revisions deployed to both regions on every release. RTO ~30 minutes (cold standby  the Step Functions state machine is pre-deployed in `us-east-1` but only one region runs at a time to avoid split-brain on the break ledger), RPO ~5 minutes (S3 CRR lag bound). The honest gap I won't paper over: if Bedrock degrades in both regions simultaneously, the daily run falls back to Layer-1-only output and ops works the breaks manually for the day  *exactly the same fallback `code/run.py` implements today* when Bedrock credentials are missing. The architectural firewall scales: ops still gets `out/raw_breaks.json` and `out/data_quality.json`, just without the agent's verdict layer.
 
-**Blast radius, kill switch, rollback  three layers, in order of how fast they fire.** Layer one is the per-break gate: the ß11 dollar + confidence thresholds (see "Eval contract" below) prevent any individual auto-clear that exceeds the policy regardless of how confident the agent claims to be. Layer two is the global kill switch: a single feature flag in DynamoDB (`agent_enabled: false`) causes the `agent_per_break` state to short-circuit to Layer-1-only output; flipping it is one IAM-gated `PutItem` from the ops on-call and propagates within the next Step Functions execution. Layer three is the rollback path for a bad prompt or a Claude model regression: AgentCore aliases let a previous prompt revision be re-pointed in seconds without a code deploy, and the eval contract's CI gate (see ß11 "Eval contract") blocks any alias swap that fails the bar. The "agent confidently auto-cleared a real break" failure mode is bounded by layer one; the "agent is broken across the board" failure mode is bounded by layer two; the "we shipped a prompt change that silently degraded precision on `quantity_mismatch`" failure mode is bounded by layer three.
+**Blast radius, kill switch, rollback  three layers, in order of how fast they fire.** Layer one is the per-break gate: the ù11 dollar + confidence thresholds (see "Eval contract" below) prevent any individual auto-clear that exceeds the policy regardless of how confident the agent claims to be. Layer two is the global kill switch: a single feature flag in DynamoDB (`agent_enabled: false`) causes the `agent_per_break` state to short-circuit to Layer-1-only output; flipping it is one IAM-gated `PutItem` from the ops on-call and propagates within the next Step Functions execution. Layer three is the rollback path for a bad prompt or a Claude model regression: AgentCore aliases let a previous prompt revision be re-pointed in seconds without a code deploy, and the eval contract's CI gate (see ù11 "Eval contract") blocks any alias swap that fails the bar. The "agent confidently auto-cleared a real break" failure mode is bounded by layer one; the "agent is broken across the board" failure mode is bounded by layer two; the "we shipped a prompt change that silently degraded precision on `quantity_mismatch`" failure mode is bounded by layer three.
 
-Read alongside the ß9 phased roadmap, these seven decisions are the depth behind each "production stack" row  not a separate plan.
+Read alongside the ù9 phased roadmap, these seven decisions are the depth behind each "production stack" row  not a separate plan.
 
 ## 6. Where AI Fits  and Where It Doesn't
 
@@ -394,11 +394,11 @@ OUTPUT_RATE = 15.00
 
 For this dataset (15 breaks), a conservative per-break envelope of ~2,000 input + ~500 output tokens puts a single run at:
 
-> `15 breaks ◊ (2_000 ◊ $3 + 500 ◊ $15) / 1_000_000 = 15 ◊ ($0.006 + $0.0075) = $0.20 / run`
+> `15 breaks ù (2_000 ù $3 + 500 ù $15) / 1_000_000 = 15 ù ($0.006 + $0.0075) = $0.20 / run`
 
-Even at 10◊ the token budget for richer evidence-gathering the run is well under a dollar. Per day across all funds: still budget dust. Per *year* with 250 trading days and a 10◊ funds growth: low four figures of LLM cost for an ops-team-month of work avoided.
+Even at 10ù the token budget for richer evidence-gathering the run is well under a dollar. Per day across all funds: still budget dust. Per *year* with 250 trading days and a 10ù funds growth: low four figures of LLM cost for an ops-team-month of work avoided.
 
-The `RunSummary` printer reports exact per-run cost as `estimated_cost_usd`; the metric should flow into CloudWatch as a custom dimension in production so a cost ceiling can be alarmed (Trust & Safety ß11).
+The `RunSummary` printer reports exact per-run cost as `estimated_cost_usd`; the metric should flow into CloudWatch as a custom dimension in production so a cost ceiling can be alarmed (Trust & Safety ù11).
 
 ## 11. Trust, Safety, and Evaluation
 
@@ -407,7 +407,7 @@ Non-negotiables before any of this touches real positions:
 - **Bedrock Guardrails** configured before first deploy (PII redaction, denied topics, prompt-injection defense).
 - **Evaluation harness** against labeled historical breaks (Strands Evals SDK). No auto-clear until precision/recall meets a documented bar per break type.
 - **Human-in-the-loop** with both a confidence threshold *and* a dollar threshold. Auto-clear only when both are below limit. Anything above either threshold routes to a human (Slack approval card in 6-month plan; ServiceNow ticket as the durable surface).
-- **Immutable audit trail**  every input, every tool call, every model response, every confidence score, every human action. DynamoDB Streams í S3 with object lock. Meets SEC 17a-4 retention.
+- **Immutable audit trail**  every input, every tool call, every model response, every confidence score, every human action. DynamoDB Streams ù S3 with object lock. Meets SEC 17a-4 retention.
 - **Cost ceiling** per session and per daily run, enforced and alarmed.
 - **Determinism where possible**  the Layer-1 firewall in this repo is a load-bearing version of this principle.
 
@@ -455,7 +455,7 @@ All three are cheap to compute from a `LabeledBreak` set; no instrumentation is 
 
 Two policy choices to defend: (1) `position_type_mismatch` and `identifier_ambiguous` are *never* auto-clearable  a direction flip and an unresolved identifier are categorically the wrong place for the agent to act, regardless of confidence. (2) The dollar ceilings above are deliberately conservative for the pilot; they ratchet up only after a documented N consecutive eval runs at the precision floor per `break_type`. No silent threshold creep.
 
-**How the harness wires in (sketch  not built).** `code/eval/` holds a `LabeledBreak[]` JSON corpus (initial size ~50 records seeded from historical breaks; grows monotonically as ops grades real production breaks), a `run_eval.py` that replays each labeled snapshot through the Layer-2 agent with deterministic-mode prompting (`temperature=0`, fixed seed), and a `report.py` that writes a CSV per release with the three metrics ◊ every `break_type` ◊ every `truth_root_cause`. A single GitHub Actions job invokes the harness on every PR that touches `code/agent.py`, `code/tools/`, the system prompt, or the pinned model id, and the job fails if any cell in the per-release CSV is below the bar above  *no model change, no prompt change, no tool change ships without passing*. This is the gating mechanism referenced in the ß9 6-month roadmap row, not a separate program.
+**How the harness wires in (sketch  not built).** `code/eval/` holds a `LabeledBreak[]` JSON corpus (initial size ~50 records seeded from historical breaks; grows monotonically as ops grades real production breaks), a `run_eval.py` that replays each labeled snapshot through the Layer-2 agent with deterministic-mode prompting (`temperature=0`, fixed seed), and a `report.py` that writes a CSV per release with the three metrics ù every `break_type` ù every `truth_root_cause`. A single GitHub Actions job invokes the harness on every PR that touches `code/agent.py`, `code/tools/`, the system prompt, or the pinned model id, and the job fails if any cell in the per-release CSV is below the bar above  *no model change, no prompt change, no tool change ships without passing*. This is the gating mechanism referenced in the ù9 6-month roadmap row, not a separate program.
 
 The agent's `escalate` verdict is the safe default. Any break with no classification, low confidence, or a tool-call failure falls into `out/escalations.json` rather than `out/resolved_breaks.json`.
 
@@ -468,7 +468,7 @@ The agent's `escalate` verdict is the safe default. Any break with no classifica
 4. Re-evaluate the `AMBIGUITY_EPSILON` borderline case for BRK.A with a richer master that distinguishes share classes via FIGI; document whether the epsilon should move or whether the master fix is the right answer.
 
 **Given another two quarters (small team, infra budget):**
-1. Stand up the production stack from ß5 / ß9  AgentCore + DynamoDB + Step Functions + EventBridge í Slack  wired to a single custodian for a pilot fund.
+1. Stand up the production stack from ù5 / ù9  AgentCore + DynamoDB + Step Functions + EventBridge ù Slack  wired to a single custodian for a pilot fund.
 2. Negotiate FIGI/ISIN on inbound files with that one custodian. Measure the `identifier_ambiguous` rate before and after.
 3. Plumb Langfuse + Bedrock token-usage metrics into CloudWatch; alarm on the cost ceiling and on per-tool latency.
 4. Build the labeled eval set into a CI gate  no model or prompt change ships without passing the precision/recall bar.
@@ -478,7 +478,7 @@ The agent's `escalate` verdict is the safe default. Any break with no classifica
 ## Repository Layout
 
 ```text
-GS-Technical-Case-Study/
+grayscale-project/
    README.md                           # this file
    Instructions.md                     # the original brief
    pyproject.toml                      # uv-managed, Python 3.13+
@@ -504,7 +504,7 @@ GS-Technical-Case-Study/
       resolved_breaks.json            # Layer 2  agent verdicts (when Bedrock available)
       escalations.json                # Layer 2  human-required (when Bedrock available)
    img/
-       architecture.png                # static export of the ß5 diagram
+       architecture.png                # static export of the ù5 diagram
 ```
 
 ## How to Run

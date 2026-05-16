@@ -15,5 +15,5 @@ dist/
 .ruff_cache/
 
 # Generated pipeline artifacts
-GS-Technical-Case-Study/out/*.json
-GS-Technical-Case-Study/out/*.csv
+out/*.json
+out/*.csv
