@@ -1,0 +1,19 @@
+# Generated pipeline artifacts — do not commit
+out/*.json
+out/*.csv
+
+# macOS
+.DS_Store
+
+# Ruff cache
+.ruff_cache/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+
+# uv
+.python-version

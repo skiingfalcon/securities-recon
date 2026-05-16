@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+
+# uv
+.python-version
+
+# Ruff cache
+.ruff_cache/
+
+# Generated pipeline artifacts
+GS-Technical-Case-Study/out/*.json
+GS-Technical-Case-Study/out/*.csv
