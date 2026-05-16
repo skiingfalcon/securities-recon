@@ -2,34 +2,7 @@
 
 A two-layer reconciliation pipeline for the small-fund EOD positions problem in [Instructions.md](Instructions.md). Layer 1 is deterministic (no LLM) and produces a canonical break ledger. Layer 2 is an optional Strands + Bedrock Claude Sonnet 4.5 agent that investigates each break with mocked OMS / corp-actions tools and emits resolution and escalation artifacts.
 
-```text
-$ uv run python -m code.pipeline.reconcile
-No book of record was supplied; reconciling custodian_a vs custodian_b only.
-Reconciliation pair: custodian_a vs custodian_b
 
-Breaks (15):
-  identifier_ambiguous   -        custodian_b   Alphabet Inc                     unresolved (custodian_b, qty=8000 LONG)
-  identifier_ambiguous   -        custodian_b   Berkshire Hathaway Class A Inc   unresolved (custodian_b, qty=-10 SHORT)
-  missing_at_custodian   SEC0004  custodian_b   GOOGL                            absent at custodian_b
-  missing_at_custodian   SEC0007  custodian_b   META                             absent at custodian_b
-  missing_at_custodian   SEC0008  custodian_b   TSLA                             absent at custodian_b
-  ... 5 more missing_at_custodian rows ...
-  position_type_mismatch SEC0003  both          NVDA                             custodian_a=LONG/10000, |delta|=15000 shares
-  quantity_mismatch      SEC0001  both          AAPL                             custodian_a_qty=75000, delta=+50000
-  quantity_mismatch      SEC0002  both          MSFT                             custodian_a_qty=18000, delta=+3000
-  quantity_mismatch      SEC0006  both          AMZN                             custodian_a_qty=15000, delta=+11000
-  quantity_mismatch      SEC0012  both          V                                custodian_a_qty=5000, delta=+2000
-
-Summary:
-  Total breaks: 15
-  identifier_ambiguous: 2
-  missing_at_custodian: 8
-  position_type_mismatch: 1
-  quantity_mismatch: 4
-runtime_seconds=0.021
-```
-
-The first stdout line is intentional: there is no book of record in the brief, so this is a custodian-vs-custodian sanity check, not a true reconciliation. That distinction matters for every decision below.
 
 ---
 
@@ -41,62 +14,7 @@ These deserve different tools. I built **(a)** as a deterministic Python pipelin
 
 The same approach is also a phased roadmap: today's slice automates the symptom, the next two quarters tackle the structural causes (FIGI/ISIN/CUSIP, real-time feeds), and the agent owns the residual exceptions that no structural fix can eliminate.
 
-## 2. Specific Observations from the Provided Files
-
-Run output backs every number below. Counts come from [out/data_quality.json](out/data_quality.json) and [out/raw_breaks.json](out/raw_breaks.json) after `uv run python -m code.pipeline.reconcile`.
-
-### Data quality / formatting
-
-- **Date year discrepancy is real and unanimous.** The brief says positions are EOD for Jan 2, **2026**, but every row in both custodian files shows year **2025**. The ingest layer preserves source truth (the parsed date stays 2025) and emits a `year_mismatch` warning for each row. **20 such warnings** are present  every single row, both custodians. Either the brief has a typo or it is a deliberate signal; either way the pipeline never silently rewrites the year.
-- **Custodian B encodes shorts as parenthesized negatives.** NVDA, BRK.A market values and shares show `(5000)`, `(4250000)`, `(10)`, `(6500000)`. The ingest layer coerces these to signed integers and emits **4 `paren_negative_coerced` warnings** (2 rows � 2 numeric fields).
-- **Custodian B mixes four date formats.** `01/02/2025`, `1/2/25`, `2025-01-02`, `02-JAN-2025`  all present in a 10-row file. The ingest layer accepts every variant and emits **19 `non_iso_date_coerced` warnings**, one per non-ISO row across both custodians.
-- **`BRK.A`'s period must be preserved.** Stripping the dot turns the ticker into `BRKA`, which has no master entry  that would silently produce a `missing_at_custodian` break for the wrong reason. The ingest layer emits a **`ticker_dot_preserved` warning** for the row and keeps the period verbatim. There is exactly 1 such warning, which is correct for this fixture.
-- **Custodian A's column is mis-named.** `trade_date` for an EOD position file is really an `as_of_date`. The pipeline labels it correctly in the `Position` model regardless.
-
-### Identification ambiguity
-
-- **"Alphabet Inc"** in Custodian B is ambiguous between SEC0004 (`GOOGL`, Class A) and SEC0005 (`GOOG`, Class C). Fuzzy string match alone cannot disambiguate share classes  both score above `FUZZY_THRESHOLD` and are within `AMBIGUITY_EPSILON` of each other. The resolver refuses to pick a winner; the Reconciler emits one `identifier_ambiguous` Break with both candidates in `alternatives`.
-- **"Berkshire Hathaway Class A Inc"** trips the same ambiguity branch  it scores nearly identically against SEC0009 (`BRK.A`) and SEC0010 (`BRK.B`). This is the borderline case predicted in [.kiro/specs/recon-demo-thought-leadership-hooks/tasks.md](../.kiro/specs/recon-demo-thought-leadership-hooks/tasks.md) task 16. **Asterisk on the expected ledger:** the spec predicted BRK.A would appear as `position_type_mismatch`; the implementation reports it as `missing_at_custodian` on the A-side + `identifier_ambiguous` on the B-side, for **15 breaks total instead of 14**. This is the resolver behaving correctly  the right fix is FIGI/ISIN, not lowering the epsilon and pretending the ambiguity does not exist.
-
-### Position-level anomalies (observed in the run)
-
-| Security | Observation | Break type |
-|---|---|---|
-| NVDA | 10,000 LONG at A / -5,000 SHORT at B | `position_type_mismatch` (delta 15,000) |
-| BRK.A | 30 LONG at A / B-side ambiguous | `missing_at_custodian` + `identifier_ambiguous` |
-| AAPL | 75,000 / 25,000 | `quantity_mismatch` (delta 50,000) |
-| AMZN | 15,000 / 4,000 | `quantity_mismatch` (delta 11,000, ~73% proportional) |
-| MSFT | 18,000 / 15,000 | `quantity_mismatch` |
-| V | 5,000 / 3,000 | `quantity_mismatch` |
-| META, TSLA, JPM, GOOGL | Only at A | `missing_at_custodian` (B-side absent) |
-| BAC, SHOP, MA | Only at B | `missing_at_custodian` (A-side absent) |
-
-Without a book of record these cannot be classified as sleeve splits vs. real breaks. **That is the point of the recon  to surface, not to decide.**
-
-## 3. Open Questions for the Business
-
-**Operating context**
-- Daily break volume and ops headcount? (Sizes the business case and the auto-clear value.)
-- SLA between custodian file arrival and market open?
-- Book of record  OMS or PMS? Read API or file drop?
-- Which custodians? Goldman PB, BNY, State Street, IBKR, Coinbase Custody all have very different integration paths.
-- Asset classes in scope? Equities here; derivatives, FX, fixed income, **crypto** are different problems.
-- Multi-entity, multi-currency, multi-fund?
-
-**Break composition**
-- Today's mix: roughly what % settlement timing vs. corp action vs. FX vs. custodian error vs. data formatting?
-- What do "cleared" and "understood-but-not-cleared" look like operationally  ticket system? audit trail?
-
-**Risk and compliance**
-- SEC 17a-4? SOC 2? Retention requirements?
-- Dollar and confidence thresholds for auto-clear? Both must bind.
-- Human-in-the-loop surface  Slack, ServiceNow, email?
-
-**Strategic**
-- Goal: *automate the existing process* (low-risk, ~6 months) or *eliminate the problem class* (multi-year, custodian renegotiation, real-time feeds, standard identifiers)?
-- Budget envelope and recurring run cost ceiling?
-
-## 4. Sub-problem 1: Data Representation
+## 2. Sub-problem 1: Data Representation
 
 ### The recon shape we built vs the canonical shape it generalizes to
 
@@ -123,17 +41,8 @@ flowchart LR
     end
 ```
 
-**Industry break-cause mix, to anchor the �11 eval bar and �10 cost math.** The numbers below are typical for asset managers processing 15-50k positions daily at 0.1-0.5% break rates (source: [Finantrix daily-recon reference](https://www.finantrix.com/articles/how-to-reconcile-custodian-vs-internal-positions-daily)):
 
-| Root cause | Industry typical share |
-|---|---|
-| Settlement timing | ~40% |
-| Corporate actions | ~25% |
-| Trade booking errors | ~20% |
-| Security master issues | ~10% |
-| System / data feed errors | ~5% |
 
-The �11 per-`break_type` precision bar should ratchet most aggressively against the settlement-timing and corporate-actions categories  auto-clearing 80% of the 40% settlement-timing slice is a bigger ops-time win than auto-clearing 100% of the 5% system-errors slice. The mocked `get_recent_trades` and `lookup_corporate_actions` tools in [code/tools/](code/tools/) are scoped to exactly those top-two categories for precisely this reason.
 
 **Why the schema scales without a rewrite.** The `Break` model in the dump below already has `book_quantity`, `book_market_value`, and `position_type_book` declared as nullable. Adding an OMS feed populates those fields and the Reconciler grows from a two-side comparison to a three-side comparison  no schema migration, no `OutputArtifact` envelope change, no test rewrites. The Layer 1 firewall and the existing `{metadata, data}` envelope stay intact; the only new code is an `ingest_oms()` helper in [code/pipeline/ingest.py](code/pipeline/ingest.py) and one branch in [code/pipeline/reconcile.py](code/pipeline/reconcile.py) that compares each custodian side against the OMS first, then against the other custodian as a cross-check.
 
@@ -221,6 +130,61 @@ The ingest layer never silently rewrites data. Every paren-negative, every non-I
 | `paren_negative_coerced` | 4 |
 | `ticker_dot_preserved` | 1 |
 | **Total** | **44** |
+
+## 3. Open Questions for the Business
+
+**Operating context**
+- Daily break volume and ops headcount? (Sizes the business case and the auto-clear value.)
+- SLA between custodian file arrival and market open?
+- Book of record  OMS or PMS? Read API or file drop?
+- Which custodians? Goldman PB, BNY, State Street, IBKR, Coinbase Custody all have very different integration paths.
+- Asset classes in scope? Equities here; derivatives, FX, fixed income, **crypto** are different problems.
+- Multi-entity, multi-currency, multi-fund?
+
+**Break composition**
+- Today's mix: roughly what % settlement timing vs. corp action vs. FX vs. custodian error vs. data formatting?
+- What do "cleared" and "understood-but-not-cleared" look like operationally  ticket system? audit trail?
+
+**Risk and compliance**
+- SEC 17a-4? SOC 2? Retention requirements?
+- Dollar and confidence thresholds for auto-clear? Both must bind.
+- Human-in-the-loop surface  Slack, ServiceNow, email?
+
+**Strategic**
+- Goal: *automate the existing process* (low-risk, ~6 months) or *eliminate the problem class* (multi-year, custodian renegotiation, real-time feeds, standard identifiers)?
+- Budget envelope and recurring run cost ceiling?
+
+## 4. Specific Observations from the Provided Files
+
+Run output backs every number below. Counts come from [out/data_quality.json](out/data_quality.json) and [out/raw_breaks.json](out/raw_breaks.json) after `uv run python -m code.pipeline.reconcile`.
+
+### Data quality / formatting
+
+- **Date year discrepancy is real and unanimous.** The brief says positions are EOD for Jan 2, **2026**, but every row in both custodian files shows year **2025**. The ingest layer preserves source truth (the parsed date stays 2025) and emits a `year_mismatch` warning for each row. **20 such warnings** are present  every single row, both custodians. Either the brief has a typo or it is a deliberate signal; either way the pipeline never silently rewrites the year.
+- **Custodian B encodes shorts as parenthesized negatives.** NVDA, BRK.A market values and shares show `(5000)`, `(4250000)`, `(10)`, `(6500000)`. The ingest layer coerces these to signed integers and emits **4 `paren_negative_coerced` warnings** (2 rows � 2 numeric fields).
+- **Custodian B mixes four date formats.** `01/02/2025`, `1/2/25`, `2025-01-02`, `02-JAN-2025`  all present in a 10-row file. The ingest layer accepts every variant and emits **19 `non_iso_date_coerced` warnings**, one per non-ISO row across both custodians.
+- **`BRK.A`'s period must be preserved.** Stripping the dot turns the ticker into `BRKA`, which has no master entry  that would silently produce a `missing_at_custodian` break for the wrong reason. The ingest layer emits a **`ticker_dot_preserved` warning** for the row and keeps the period verbatim. There is exactly 1 such warning, which is correct for this fixture.
+- **Custodian A's column is mis-named.** `trade_date` for an EOD position file is really an `as_of_date`. The pipeline labels it correctly in the `Position` model regardless.
+
+### Identification ambiguity
+
+- **"Alphabet Inc"** in Custodian B is ambiguous between SEC0004 (`GOOGL`, Class A) and SEC0005 (`GOOG`, Class C). Fuzzy string match alone cannot disambiguate share classes  both score above `FUZZY_THRESHOLD` and are within `AMBIGUITY_EPSILON` of each other. The resolver refuses to pick a winner; the Reconciler emits one `identifier_ambiguous` Break with both candidates in `alternatives`.
+- **"Berkshire Hathaway Class A Inc"** trips the same ambiguity branch  it scores nearly identically against SEC0009 (`BRK.A`) and SEC0010 (`BRK.B`). This is the borderline case predicted in [.kiro/specs/recon-demo-thought-leadership-hooks/tasks.md](../.kiro/specs/recon-demo-thought-leadership-hooks/tasks.md) task 16. **Asterisk on the expected ledger:** the spec predicted BRK.A would appear as `position_type_mismatch`; the implementation reports it as `missing_at_custodian` on the A-side + `identifier_ambiguous` on the B-side, for **15 breaks total instead of 14**. This is the resolver behaving correctly  the right fix is FIGI/ISIN, not lowering the epsilon and pretending the ambiguity does not exist.
+
+### Position-level anomalies (observed in the run)
+
+| Security | Observation | Break type |
+|---|---|---|
+| NVDA | 10,000 LONG at A / -5,000 SHORT at B | `position_type_mismatch` (delta 15,000) |
+| BRK.A | 30 LONG at A / B-side ambiguous | `missing_at_custodian` + `identifier_ambiguous` |
+| AAPL | 75,000 / 25,000 | `quantity_mismatch` (delta 50,000) |
+| AMZN | 15,000 / 4,000 | `quantity_mismatch` (delta 11,000, ~73% proportional) |
+| MSFT | 18,000 / 15,000 | `quantity_mismatch` |
+| V | 5,000 / 3,000 | `quantity_mismatch` |
+| META, TSLA, JPM, GOOGL | Only at A | `missing_at_custodian` (B-side absent) |
+| BAC, SHOP, MA | Only at B | `missing_at_custodian` (A-side absent) |
+
+Without a book of record these cannot be classified as sleeve splits vs. real breaks. **That is the point of the recon  to surface, not to decide.**
 
 ## 5. Sub-problem 2: Architecture
 
