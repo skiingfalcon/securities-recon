@@ -1,4 +1,4 @@
-"""Layer 2 — Agent_Runtime (Strands + Bedrock Claude Sonnet).
+"""Layer 2 — Agent_Runtime (Strands + Bedrock Claude Sonnet 4.5).
 
 This module is the *only* place where Strands SDK code lives. The Layer-1
 firewall in design.md §3 forbids ``code/pipeline/`` and ``code/models.py``
@@ -28,10 +28,9 @@ from code.tools.trades import get_recent_trades
 # project is approved for Bedrock model access.
 BEDROCK_REGION = "us-west-2"
 
-# Default Claude Sonnet 3.7 cross-region inference profile. Matches the
-# strands SDK's DEFAULT_BEDROCK_MODEL_ID at install time; override via
-# the ``model_id`` kwarg if a future model is preferred.
-BEDROCK_MODEL_ID = "us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+# Claude Sonnet 4.5 US cross-region inference profile (Bedrock).
+# https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids.html
+BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 # System prompt scopes the agent to break-investigation only. The agent
 # may call lookup_security, get_recent_trades, lookup_corporate_actions,

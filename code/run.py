@@ -17,7 +17,7 @@ from code.pipeline.reconcile import (
     run_layer1,
 )
 
-# Bedrock on-demand pricing for Claude 3.7 Sonnet (us-west-2), USD per
+# Bedrock on-demand pricing for Claude Sonnet 4.5 (us-west-2), USD per
 # million tokens. Confirm rates at run time via
 # awslabs.aws-pricing-mcp-server per .kiro/steering/mcp-tools-usage.md.
 # Reference: https://aws.amazon.com/bedrock/pricing/
