@@ -1,0 +1,51 @@
+flowchart TB
+    subgraph Inputs[Inputs - GS-Technical-Case-Study/]
+        CSV_A[custodian_a.csv]
+        CSV_B[custodian_b.csv]
+        CSV_M[securities_reference.csv]
+    end
+
+    subgraph L1[Layer 1 - Deterministic - no LLM]
+        Ingest[Ingest_Module<br/>parse + normalize<br/>emit IngestWarning]
+        Resolver[Identifier_Resolver<br/>rapidfuzz match<br/>SecurityMatch with alternatives]
+        Reconciler[Reconciler<br/>join across custodians<br/>emit Break records]
+    end
+
+    subgraph L1_Out[Layer 1 Outputs]
+        Raw[out/raw_breaks.json<br/>metadata + data]
+        DQ[out/data_quality.json<br/>metadata + data]
+    end
+
+    subgraph L2[Layer 2 - Agentic - Strands + Bedrock]
+        Agent[Agent_Runtime<br/>Claude Sonnet via BedrockModel<br/>tools: lookup, trades, corp_actions, classify]
+        Cost[Cost_Reporter<br/>tokens + USD + runtime]
+    end
+
+    subgraph L2_Out[Layer 2 Outputs]
+        Resolved[out/resolved_breaks.json]
+        Esc[out/escalations.json]
+        Stdout[Run_Summary stdout<br/>'no book of record' line<br/>cost summary]
+    end
+
+    CSV_A --> Ingest
+    CSV_B --> Ingest
+    CSV_M --> Resolver
+    Ingest --> Resolver
+    Resolver --> Reconciler
+    Reconciler --> Raw
+    Ingest --> DQ
+    Resolver --> DQ
+
+    Raw -.-> Agent
+    Agent -.-> Resolved
+    Agent -.-> Esc
+    Agent -.-> Cost
+    Cost -.-> Stdout
+    Reconciler --> Stdout
+
+    classDef l1 fill:#e8f4f8,stroke:#2b6cb0
+    classDef l2 fill:#fef5e7,stroke:#c05621,stroke-dasharray: 5 5
+    classDef io fill:#f0fff4,stroke:#2f855a
+    class Ingest,Resolver,Reconciler l1
+    class Agent,Cost l2
+    class CSV_A,CSV_B,CSV_M,Raw,DQ,Resolved,Esc,Stdout io

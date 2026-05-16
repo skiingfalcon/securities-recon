@@ -9,11 +9,18 @@ Algorithm C from design.md ยง5.C is implemented in reconcile().
 """
 
 import hashlib
-from collections import defaultdict
-from datetime import date
+import json
+import subprocess
+import time
+from collections import Counter, defaultdict
+from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import Literal
 
-from code.models import Break, IngestWarning, Position
+from pydantic import BaseModel
+
+from code.models import ArtifactMetadata, Break, IngestWarning, OutputArtifact, Position
+from code.pipeline.ingest import ingest_custodian_a, ingest_custodian_b
 from code.tools.securities import IdentifierResolver
 
 # ---------------------------------------------------------------------------
@@ -140,11 +147,7 @@ def reconcile(
     # Build the resolver lazily so callers that already have one don't pay
     # the CSV-read cost twice.
     if resolver is None:
-        from pathlib import Path
-
-        master_path = (
-            Path(__file__).parent.parent.parent / "securities_reference.csv"
-        )
+        master_path = Path(__file__).parent.parent.parent / "securities_reference.csv"
         resolver = IdentifierResolver(master_path)
 
     # Pre-build the warning index so we can attach per-row warnings to each
@@ -367,3 +370,215 @@ def reconcile(
         # This is the happy path; no Break record is emitted.
 
     return breaks
+
+
+# ---------------------------------------------------------------------------
+# Phase 5  OutputArtifact envelope helpers (design.md ง5.D)
+# ---------------------------------------------------------------------------
+
+
+def compute_input_hashes(paths: dict[str, Path]) -> dict[str, str]:
+    """Compute SHA-256 digests for every input file in a single streaming pass.
+
+    Uses ``hashlib.file_digest`` (Python 3.11+) which streams the file in
+    chunks so we never materialise the whole CSV in memory  important if
+    custodian files grow to GB scale in production.
+    """
+    hashes: dict[str, str] = {}
+    for label, path in paths.items():
+        with path.open("rb") as fh:
+            hashes[label] = hashlib.file_digest(fh, "sha256").hexdigest()
+    return hashes
+
+
+def read_git_short_sha() -> str:
+    """Return the current git short SHA, or the literal ``"uncommitted"``.
+
+    MUST NOT raise. Req 5 AC 3 makes the metadata envelope a hard invariant
+    of every artifact write, so a missing git binary, a non-git directory,
+    or any subprocess failure has to degrade silently.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "uncommitted"
+    if result.returncode != 0:
+        return "uncommitted"
+    sha = result.stdout.strip()
+    return sha or "uncommitted"
+
+
+def write_envelope(
+    path: Path,
+    records: list[BaseModel],
+    metadata: ArtifactMetadata,
+) -> None:
+    """Serialise records inside an OutputArtifact envelope and write to disk.
+
+    Every JSON artifact in ``out/`` shares the same ``{metadata, data}``
+    shape so reviewers can verify provenance (input hashes, commit, as-of)
+    without reading the data block. See design.md ง5.D and Req 5 AC 1, 2.
+    """
+    envelope = OutputArtifact(
+        metadata=metadata,
+        data=[r.model_dump(mode="json") for r in records],
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(envelope.model_dump(mode="json"), fh, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6  Run summary printer (Req 4 AC 1, 4)
+# ---------------------------------------------------------------------------
+
+
+def _format_break_line(b: Break) -> str:
+    """Render one Break as a compact, fixed-column-ish stdout line.
+
+    All data is read straight off the Break record  no joins back to the
+    Position list. For one-sided breaks the present-side identifier comes
+    out of raw_source_row; for two-sided breaks raw_source_row is the
+    A-side (per the Reconciler), so the symbol is there. The B-side
+    quantities are intentionally not reconstructed  the canonical truth
+    lives in out/raw_breaks.json.
+    """
+    sec = b.security_id or "-"
+    ident = b.raw_source_row.get("symbol") or b.raw_source_row.get("security_description") or ""
+    if len(ident) > 32:
+        ident = ident[:29] + "..."
+    if b.break_type == "quantity_mismatch":
+        detail = f"custodian_a_qty={b.custodian_quantity}, delta={b.quantity_delta:+d}"
+    elif b.break_type == "position_type_mismatch":
+        detail = (
+            f"custodian_a={b.position_type_custodian}/{b.custodian_quantity}, "
+            f"|delta|={abs(b.quantity_delta or 0)} shares"
+        )
+    elif b.break_type == "missing_at_custodian":
+        detail = f"absent at {b.custodian}"
+    elif b.break_type == "identifier_ambiguous":
+        detail = (
+            f"unresolved ({b.custodian}, qty={b.custodian_quantity} {b.position_type_custodian})"
+        )
+    elif b.break_type == "value_mismatch":
+        detail = f"value_delta={b.value_delta:+.2f}"
+    else:
+        detail = ""
+    return f"  {b.break_type:22s} {sec:8s} {b.custodian:13s} {ident:32s} {detail}"
+
+
+def print_run_summary(breaks: list[Break], runtime_seconds: float) -> None:
+    """Print the Layer-1 run summary to stdout.
+
+    The very first line MUST be the no-book-of-record disclosure (Req 4
+    AC 1). Reviewers grep for this line to confirm the pipeline is honest
+    about not having a true book of record to reconcile against.
+
+    Output shape:
+        1. No-book disclosure (verbatim, Req 4 AC 1)
+        2. Reconciliation pair (verbatim, Req 4 AC 4)
+        3. Per-break detail block, sorted by (break_type, security_id)
+        4. Summary block  totals + per-type counts
+        5. runtime_seconds=... (absolute last line, tail-friendly)
+    """
+    print("No book of record was supplied; reconciling custodian_a vs custodian_b only.")
+    print("Reconciliation pair: custodian_a vs custodian_b")
+
+    # Sort by (break_type, security_id) so reviewers can scan visually:
+    # all ambiguous together, all missing together, all quantity together.
+    # Ambiguous breaks (security_id is None) sort last within their type
+    # via the "zzz" sentinel.
+    sorted_breaks = sorted(breaks, key=lambda b: (b.break_type, b.security_id or "zzz"))
+    print(f"\nBreaks ({len(breaks)}):")
+    for b in sorted_breaks:
+        print(_format_break_line(b))
+
+    counts = Counter(b.break_type for b in breaks)
+    print("\nSummary:")
+    print(f"  Total breaks: {len(breaks)}")
+    for break_type, count in sorted(counts.items()):
+        print(f"  {break_type}: {count}")
+    print(f"runtime_seconds={runtime_seconds:.3f}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 6  Layer-1 entrypoint (Req 4 AC 1, 4, 5; Req 5 AC 4; Req 6 AC 2)
+# ---------------------------------------------------------------------------
+
+
+def run_layer1(
+    project_root: Path,
+    out_dir: Path | None = None,
+    as_of_date: date = date(2026, 1, 2),
+    configured_year: int = 2026,
+) -> list[Break]:
+    """Orchestrate Ingest -> Reconcile -> write envelopes -> print summary.
+
+    This is the Layer-1-only entry point. It MUST NOT import from
+    ``code.agent`` or any Strands SDK module (Req 7 AC 2). The Phase 8
+    ``code.run`` module calls this function first and then attempts the
+    agent path on top, so a Bedrock auth failure still leaves both
+    Layer-1 artifacts on disk.
+
+    Args:
+        project_root: Directory containing the three input CSVs.
+        out_dir: Where to write the JSON artifacts. Defaults to
+            ``project_root / "out"``. Tests pass a ``tmp_path``.
+        as_of_date: Reconciliation date stamped into break_ids + metadata.
+        configured_year: Authoritative year for year_mismatch warnings.
+
+    Returns:
+        The list of Break records (so callers like ``code.run`` can feed
+        them to the agent without re-running ingest).
+    """
+    if out_dir is None:
+        out_dir = project_root / "out"
+
+    started = time.monotonic()
+
+    input_paths = {
+        "custodian_a.csv": project_root / "custodian_a.csv",
+        "custodian_b.csv": project_root / "custodian_b.csv",
+        "securities_reference.csv": project_root / "securities_reference.csv",
+    }
+
+    positions_a, warnings_a = ingest_custodian_a(
+        input_paths["custodian_a.csv"], configured_year=configured_year
+    )
+    positions_b, warnings_b = ingest_custodian_b(
+        input_paths["custodian_b.csv"], configured_year=configured_year
+    )
+    all_warnings = warnings_a + warnings_b
+
+    resolver = IdentifierResolver(input_paths["securities_reference.csv"])
+    breaks = reconcile(positions_a, positions_b, all_warnings, as_of=as_of_date, resolver=resolver)
+
+    metadata = ArtifactMetadata(
+        ruleset_version="0.1.0",
+        code_commit=read_git_short_sha(),
+        input_file_sha256s=compute_input_hashes(input_paths),
+        as_of_date=as_of_date,
+        generated_at=datetime.now(UTC),
+    )
+
+    write_envelope(out_dir / "raw_breaks.json", breaks, metadata)
+    write_envelope(out_dir / "data_quality.json", all_warnings, metadata)
+
+    runtime_seconds = time.monotonic() - started
+    print_run_summary(breaks, runtime_seconds)
+
+    return breaks
+
+
+if __name__ == "__main__":
+    # Resolve the project root by walking up from this file. The layout is:
+    #   GS-Technical-Case-Study/code/pipeline/reconcile.py  (this file)
+    #   GS-Technical-Case-Study/                            (the project root)
+    project_root = Path(__file__).resolve().parent.parent.parent
+    run_layer1(project_root)

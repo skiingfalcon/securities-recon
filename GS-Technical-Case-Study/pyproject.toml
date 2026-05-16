@@ -43,4 +43,9 @@ indent-style = "space"
 
 [tool.pytest.ini_options]
 testpaths = ["code/tests"]
-addopts = "-v"
+# The package directory is named "code", which collides with the Python
+# stdlib "code" module that pdb depends on. importlib import mode skips
+# the sys.path manipulation that would otherwise shadow the stdlib module
+# during pytest collection.
+# See https://docs.pytest.org/en/stable/explanation/pythonpath.html#import-modes
+addopts = "-v --import-mode=importlib"

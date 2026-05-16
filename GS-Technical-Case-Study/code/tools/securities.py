@@ -8,12 +8,12 @@ This module is also the Layer 2 @tool surface: lookup_security wraps the
 same resolve() logic so the agent calls the same code path.
 """
 
+import csv
 from pathlib import Path
 from typing import Literal
 
-import csv
-
-from rapidfuzz import fuzz, process as fuzz_process
+from rapidfuzz import fuzz
+from rapidfuzz import process as fuzz_process
 
 from code.models import SecurityMatch
 
@@ -140,9 +140,7 @@ class IdentifierResolver:
         candidates: list[dict[str, str | float]] = []
         for matched_name, score, idx in raw_results:
             security_id, _ = self._by_name_choices[idx]
-            candidates.append(
-                {"security_id": security_id, "confidence": score / 100.0}
-            )
+            candidates.append({"security_id": security_id, "confidence": score / 100.0})
 
         # Step 2.3: Sort by confidence descending (rapidfuzz already returns sorted,
         # but we sort explicitly to guarantee the invariant regardless of library version).
@@ -154,10 +152,7 @@ class IdentifierResolver:
         top_confidence = candidates[0]["confidence"] if candidates else 0.0
 
         if not candidates or top_confidence < self.fuzzy_threshold:
-            alternatives = [
-                c for c in candidates
-                if c["confidence"] >= self.fuzzy_threshold / 2
-            ]
+            alternatives = [c for c in candidates if c["confidence"] >= self.fuzzy_threshold / 2]
             return SecurityMatch(
                 security_id=None,
                 confidence=top_confidence,
@@ -186,10 +181,7 @@ class IdentifierResolver:
         # unambiguously ahead of the second. Return the winner plus any runner-up
         # candidates that clear the half-threshold bar as informational alternatives.
         top = candidates[0]
-        alternatives = [
-            c for c in candidates[1:]
-            if c["confidence"] >= self.fuzzy_threshold / 2
-        ]
+        alternatives = [c for c in candidates[1:] if c["confidence"] >= self.fuzzy_threshold / 2]
         return SecurityMatch(
             security_id=str(top["security_id"]),
             confidence=float(top["confidence"]),

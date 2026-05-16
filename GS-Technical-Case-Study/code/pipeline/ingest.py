@@ -14,7 +14,6 @@ from dateutil import parser as dateutil_parser
 
 from code.models import IngestWarning, Position
 
-
 # ---------------------------------------------------------------------------
 # Numeric coercion helpers
 # ---------------------------------------------------------------------------
@@ -263,9 +262,7 @@ def normalize_identifier(
             type="ticker_dot_preserved",
             source_file=source_file,
             source_row_index=source_row_index,
-            message=(
-                f"Ticker-like identifier with dot preserved verbatim: {stripped!r}"
-            ),
+            message=(f"Ticker-like identifier with dot preserved verbatim: {stripped!r}"),
             detail={"raw": raw, "preserved": stripped},
         )
         return stripped, warning
@@ -326,16 +323,12 @@ def ingest_custodian_a(
             # Custodian A uses plain ints, but we run parse_paren_int for
             # consistency — if a future file revision adds parens, the warning
             # fires automatically rather than causing a silent parse error.
-            quantity, qty_warn = parse_paren_int(
-                row["quantity"], path.name, row_idx
-            )
+            quantity, qty_warn = parse_paren_int(row["quantity"], path.name, row_idx)
             if qty_warn is not None:
                 row_warnings.append(qty_warn)
 
             # --- Step b: parse market_value ---
-            market_value, mv_warn = parse_paren_float(
-                row["market_value"], path.name, row_idx
-            )
+            market_value, mv_warn = parse_paren_float(row["market_value"], path.name, row_idx)
             if mv_warn is not None:
                 row_warnings.append(mv_warn)
 
@@ -353,9 +346,7 @@ def ingest_custodian_a(
             # normalize_identifier preserves dots in ticker-like strings
             # (e.g. "BRK.A") and emits a ticker_dot_preserved warning so the
             # coercion is visible in out/data_quality.json.
-            symbol, sym_warn = normalize_identifier(
-                row["symbol"], path.name, row_idx
-            )
+            symbol, sym_warn = normalize_identifier(row["symbol"], path.name, row_idx)
             if sym_warn is not None:
                 row_warnings.append(sym_warn)
 
@@ -437,18 +428,14 @@ def ingest_custodian_b(
             # accounting convention. parse_paren_int normalises that to -5000
             # and emits a paren_negative_coerced warning so the coercion is
             # never silent.
-            quantity, qty_warn = parse_paren_int(
-                row["1d_shares"], path.name, row_idx
-            )
+            quantity, qty_warn = parse_paren_int(row["1d_shares"], path.name, row_idx)
             if qty_warn is not None:
                 row_warnings.append(qty_warn)
 
             # --- Step b: parse market_value (same paren convention) ---
             # NVDA shows "(4250000)" and BRK.A shows "(6500000)" in the source
             # file — both are short positions with negative market values.
-            market_value, mv_warn = parse_paren_float(
-                row["market_value_usd"], path.name, row_idx
-            )
+            market_value, mv_warn = parse_paren_float(row["market_value_usd"], path.name, row_idx)
             if mv_warn is not None:
                 row_warnings.append(mv_warn)
 
@@ -479,9 +466,7 @@ def ingest_custodian_b(
             # a negative quantity means SHORT; zero or positive means LONG.
             # This mirrors the accounting convention: short positions are
             # liabilities and are represented as negative quantities.
-            position_type: Literal["LONG", "SHORT"] = (
-                "SHORT" if quantity < 0 else "LONG"
-            )
+            position_type: Literal["LONG", "SHORT"] = "SHORT" if quantity < 0 else "LONG"
 
             # --- Step f: collect non-None warnings (already done above) ---
 
