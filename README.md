@@ -2,7 +2,14 @@
 
 A two-layer reconciliation pipeline for the small-fund EOD positions problem in [Instructions.md](Instructions.md). Layer 1 is deterministic (no LLM) and produces a canonical break ledger. Layer 2 is an optional Strands + Bedrock Claude Sonnet 4.5 agent that investigates each break with mocked OMS / corp-actions tools and emits resolution and escalation artifacts.
 
+## Strategic goal
 
+The brief asks how to **completely eliminate** morning recon as a manual fire drill. The credible end game is **not** zero breaks forever — it is:
+
+1. **Eliminate structural causes** — standard identifiers (FIGI/ISIN/CUSIP), real-time custodian feeds, straight-through processing — so break volume falls by orders of magnitude.
+2. **Manage the residual** — settlement timing edge cases, corp-action misses, custodian errors — via agentic exception handling with human gates, eval harnesses, and a provably falling break rate over time.
+
+**Near term:** automate today's EOD CSV workflow (~6 months, lower risk). **Long term:** eliminate the problem class (multi-year program: custodian standards, streaming positions, STP), with the AWS production architecture in [architecture/production_design.md](architecture/production_design.md). This repo proves both layers on the supplied fixtures — deterministic reconcile first, Bedrock agent on the exception queue second. Full framing in [§8](#8-honest-framing-of-eliminate) and the phased path in [§9](#9-phased-roadmap).
 
 ---
 
@@ -10,9 +17,25 @@ A two-layer reconciliation pipeline for the small-fund EOD positions problem in 
 
 The fund's morning recon is two real problems wearing one label: **(a)** a deterministic data-shaping problem — different schemas, paren-negative shorts, four date formats, description-vs-ticker matching — and **(b)** an investigative problem — once a break is surfaced, ops has to pull trades, check the corp-action calendar, and decide whether to clear or escalate.
 
-These deserve different tools. I built **(a)** as a deterministic Python pipeline (`code/pipeline/`) that emits a canonical `Break` record and a structured `IngestWarning` for every coercion. I built **(b)** as an optional Strands agent on Bedrock Claude Sonnet 4.5 (`code/agent.py` + `code/run.py`) that calls four `@tool`s and ends each turn with a verdict. The layers are firewalled — Layer 1 never imports Strands — so reviewers without Bedrock credentials still get the deterministic ledger and a clean stdout summary.
+These deserve different tools. I built **(a)** as a deterministic Python pipeline (`code/pipeline/`) that emits a canonical `Break` record and a structured `IngestWarning` for every coercion. I built **(b)** as an optional Strands agent on Bedrock Claude Sonnet 4.5 (`code/agent.py` + `code/run.py`) that calls four `@tool`s and ends each turn with a verdict. See [Tenets of design](#tenets-of-design) for the rules that keep the two layers separated.
 
 The same approach is also a phased roadmap: today's slice automates the symptom, the next two quarters tackle the structural causes (FIGI/ISIN/CUSIP, real-time feeds), and the agent owns the residual exceptions that no structural fix can eliminate.
+
+## Tenets of design
+
+Five rules that govern the design of this pipeline.
+
+1. **Determinism before judgment** — Ingest, identifier resolution, and break detection belong in deterministic code. LLMs investigate exceptions only after the break ledger exists.
+
+2. **Never silently rewrite source truth** — Every normalization is visible. When the data is ambiguous, the system surfaces the ambiguity instead of guessing.
+
+3. **The agent recommends; it does not act** — The agent gathers evidence and proposes a verdict. It does not update books, move money, or mutate custodian data. Unclear outcomes go to a human.
+
+4. **Every artifact must be auditable and reproducible** — Outputs carry provenance. Each break preserves what the custodian actually sent so ops can reconstruct and defend every decision.
+
+5. **Production extends the demo, it does not replace it** — Production is how you host this laptop prototype at fund scale without rewriting it: the same Layer 1 pipeline and Layer 2 agent surface map onto managed AWS — custodian files in S3, Step Functions for ingest → reconcile → agent → human approval, Bedrock AgentCore for the Strands runtime with tools through AgentCore Gateway. Compliance and safety move into infrastructure — immutable audit storage, Guardrails, least-privilege access per step, and human-in-the-loop callbacks — so behavior at scale matches what the demo already proves.
+
+The sections below show how these tenets appear in schema (§2), the fixture observations (§4), architecture (§5), and [production deployment](architecture/production_design.md).
 
 ## 2. Sub-problem 1: Data Representation
 
@@ -150,9 +173,46 @@ The ingest layer never silently rewrites data. Every paren-negative, every non-I
 - Dollar and confidence thresholds for auto-clear? Both must bind.
 - Human-in-the-loop surface — Slack, ServiceNow, email?
 
-**Strategic**
-- Goal: *automate the existing process* (low-risk, ~6 months) or *eliminate the problem class* (multi-year, custodian renegotiation, real-time feeds, standard identifiers)?
+**Strategic** (see [Strategic goal](#strategic-goal) at the top for the automate-vs-eliminate fork)
 - Budget envelope and recurring run cost ceiling?
+
+## Repository Layout
+
+Brief map of the repo (inputs, code, generated artifacts, diagrams) before the file-specific observations in section 4.
+
+```text
+grayscale-project/
+  README.md                    # This writeup: analysis, architecture, how to run
+  Instructions.md              # Original case-study brief and deliverables
+  pyproject.toml               # Project metadata and dependencies (uv)
+  uv.lock                      # Locked dependency versions
+  custodian_a.csv              # Input: ticker-based EOD positions (Custodian A)
+  custodian_b.csv              # Input: description-based EOD positions (Custodian B)
+  securities_reference.csv     # Canonical security master (20 equities)
+  code/
+    models.py                  # Pydantic models: Break, IngestWarning, OutputArtifact
+    pipeline/
+      ingest.py                # Layer 1: parse and normalize custodian CSVs
+      reconcile.py             # Layer 1: cross-custodian join and break detection
+    tools/
+      securities.py            # Identifier resolver (+ Layer 2 lookup_security tool)
+      trades.py                # Mocked recent-trades blotter (@tool)
+      corporate_actions.py     # Mocked corp-action calendar (@tool)
+      classification.py        # Agent verdict capture (@tool)
+    agent.py                   # Layer 2: Strands agent on Bedrock Claude Sonnet 4.5
+    run.py                     # Entrypoint: Layer 1 + Layer 2 + cost summary
+    tests/                     # Acceptance tests for ingest, reconcile, resolver
+  out/                         # Generated artifacts (JSON gitignored; sampleout.txt kept)
+    raw_breaks.json            # Layer 1 break ledger
+    data_quality.json          # Layer 1 ingest-warning ledger
+    sampleout.txt              # Example terminal log (Layer 1 + partial Layer 2)
+    resolved_breaks.json       # Layer 2 auto-cleared / investigated verdicts
+    escalations.json           # Layer 2 breaks requiring human review
+  architecture/
+    low_level_architecture.mmd   # Mermaid source for section 5 demo diagram
+    low_level_architecture.png   # Static export of section 5 demo diagram
+    production_design.md       # Production AWS deployment (S3, Step Functions, AgentCore, DynamoDB)
+```
 
 ## 4. Specific Observations from the Provided Files
 
@@ -279,25 +339,11 @@ The mocked tool data plus the §11 auto-clear policy produce a real triage outco
 
 Exact split depends on what Claude decides on each run; the *shape* is what changed from a prior "everything escalates" behavior (the verdict-capture bug in `_extract_classification` is fixed; see `_default_escalate` in [code/agent.py](code/agent.py) for the safety fallback). `out/resolved_breaks.json` and `out/escalations.json` are the source of truth.
 
-### Layer 3 — production architecture (roadmap, defended)
+### Layer 3 — production architecture (roadmap)
 
-The §9 phased roadmap names the production stack at a glance. This subsection defends each service choice the way I'd defend it in a design review.
+Production lifts the same two-layer design into a fully managed, event-driven AWS stack: S3 ingestion, Lambda for the existing pipeline modules, Step Functions for orchestration, DynamoDB for break state, Bedrock AgentCore for the agent and Gateway-backed tools, plus EventBridge/SNS for escalations. The demo’s `code/run.py` Layer-1-only fallback still applies if Bedrock is unavailable — ops get breaks and data-quality artifacts even when the agent path is down.
 
-**Orchestration — Step Functions over EventBridge Scheduler + Lambda or Airflow.** The daily run is a deterministic DAG with a small number of well-named states (`ingest_a`, `ingest_b`, `reconcile`, `write_layer1_artifacts`, `agent_per_break`, `write_layer2_artifacts`, `notify`). Step Functions wins on three axes: the state-machine diagram doubles as the operational runbook (an ops engineer on-call at 7:45am with a failing run reads the visual execution, not a Lambda log soup); per-state retry semantics with exponential backoff are a configuration, not code; and per-transition pricing keeps the cost ceiling visible (a daily run with ~50 transitions is cents, predictable, alarmable). The acknowledged trade-off is cold-start latency on the first transition of the day — measured in low single-digit seconds, irrelevant against a multi-minute SLA. Airflow was rejected as over-engineered for a single daily DAG with no cross-DAG dependencies; EventBridge Scheduler + raw Lambda was rejected because per-state visibility collapses into "find the right log group" the moment something fails partway through.
-
-**State store — DynamoDB over Postgres, with the access pattern designed up front.** The `Break` ledger is keyed on `pk = security_id`, `sk = as_of_date#custodian`. That partition key serves the agent's hot path — *"give me everything I know about SEC0001 across the last N days"* — in single-digit milliseconds, which sets the latency floor for the per-break tool calls in Layer 2. The daily ops dashboard scans the inverse range, `pk = as_of_date`, via a GSI on `as_of_date` with `sk = security_id`. A third GSI on `break_type` powers class-level analytics (`"how many quantity_mismatch breaks did we see this quarter?"`). Postgres was rejected because the access pattern is read-by-key in the hot path and the relational model adds connection-pool failure modes the agent step would have to handle. The acknowledged trade-off — ad-hoc analytical queries are awkward on DynamoDB — is answered by mirroring every `Break` write to S3 via DynamoDB Streams and querying that mirror with Athena. Analysts get SQL; the operational store stays single-purpose.
-
-**Agent hosting — Bedrock AgentCore over self-hosted Strands on ECS Fargate.** AgentCore brings managed session state, identity propagation from the calling principal, native CloudWatch + X-Ray traces, and *Guardrails as a first-class configuration* rather than a sidecar to wire in. The lock-in concern is real but bounded: the agent's value lives in the `@tool` surface, and `code/agent.py` already proves that surface is portable — moving to Fargate-hosted Strands is a hosting-layer migration (re-point the tool registrations, rewire IAM), not a rewrite. Self-hosted was rejected because every advantage it offered (custom routing, exotic model providers) is something this use case doesn't need, and every cost it imposes (container patching, autoscaling tuning, manual trace plumbing) is something the team will pay for daily.
-
-**Observability and the cost ceiling — three metrics that earn their alarm, not "best-effort logging."** Production publishes exactly three CloudWatch custom metrics per run, and each one has a wired alarm: (1) `break_count_by_type` — alarms on a step-change vs. the trailing 30-day median per type, because a 10x spike in `missing_at_custodian` on a Tuesday morning is the leading indicator of a custodian outage; (2) `tokens_per_run` rolled up to `estimated_cost_usd` per day, with a hard per-day dollar ceiling that pages ops if exceeded — the cost-reporter math in `code/run.py` is the source of truth here, not a hand-built dashboard; (3) `agent_p95_latency_ms` per `break_type`, because a slow agent is a leading indicator of a model regression or a tool-call timeout. CloudWatch is the operational surface; Langfuse runs alongside as the LLM-specific tracing layer (prompt diff replay across releases, per-tool token attribution). The two are complements, not duplicates — CloudWatch alarms wake the on-call; Langfuse explains *why* after the fact.
-
-**Identity, secrets, network — least-privilege per state, never per pipeline.** Each Step Functions state has its own IAM role. The `ingest_a` state can read its custodian's S3 prefix and write to the raw-positions DynamoDB table; it *cannot* write to the resolved-breaks table or call Bedrock. The `agent_per_break` state can read the raw-breaks table and call Bedrock + the OMS / corp-actions PrivateLink endpoints; it *cannot* read the raw custodian archive (no business reason) and *cannot* write to the auto-clear ledger (that's a separate state with a separate role enforcing the §11 thresholds). Custodian SFTP credentials and any OMS API tokens live in Secrets Manager with rotation lambdas; nothing ships in environment variables. All Bedrock traffic uses a VPC endpoint so prompts containing real position data never traverse the public internet; all internal tool calls (`get_recent_trades`, `lookup_corporate_actions`) go over PrivateLink to the OMS and corp-actions services. The blast radius of any single compromised state's credentials is therefore exactly the data that state legitimately touches.
-
-**Multi-region and DR — primary `us-west-2`, warm-but-honest in `us-east-1`.** Bedrock is regional and model availability differs by region, so the failover stance has to be explicit. Primary in `us-west-2` with cross-region replication for the durable layer: S3 CRR to `us-east-1`, DynamoDB Global Tables for the break ledger, AgentCore prompt revisions deployed to both regions on every release. RTO ~30 minutes (cold standby — the Step Functions state machine is pre-deployed in `us-east-1` but only one region runs at a time to avoid split-brain on the break ledger), RPO ~5 minutes (S3 CRR lag bound). The honest gap I won't paper over: if Bedrock degrades in both regions simultaneously, the daily run falls back to Layer-1-only output and ops works the breaks manually for the day — *exactly the same fallback `code/run.py` implements today* when Bedrock credentials are missing. The architectural firewall scales: ops still gets `out/raw_breaks.json` and `out/data_quality.json`, just without the agent's verdict layer.
-
-**Blast radius, kill switch, rollback — three layers, in order of how fast they fire.** Layer one is the per-break gate: the §11 dollar + confidence thresholds (see "Eval contract" below) prevent any individual auto-clear that exceeds the policy regardless of how confident the agent claims to be. Layer two is the global kill switch: a single feature flag in DynamoDB (`agent_enabled: false`) causes the `agent_per_break` state to short-circuit to Layer-1-only output; flipping it is one IAM-gated `PutItem` from the ops on-call and propagates within the next Step Functions execution. Layer three is the rollback path for a bad prompt or a Claude model regression: AgentCore aliases let a previous prompt revision be re-pointed in seconds without a code deploy, and the eval contract's CI gate (see §11 "Eval contract") blocks any alias swap that fails the bar. The "agent confidently auto-cleared a real break" failure mode is bounded by layer one; the "agent is broken across the board" failure mode is bounded by layer two; the "we shipped a prompt change that silently degraded precision on `quantity_mismatch`" failure mode is bounded by layer three.
-
-Read alongside the §9 phased roadmap, these seven decisions are the depth behind each "production stack" row — not a separate plan.
+**Full design:** [architecture/production_design.md](architecture/production_design.md) — components, data flow, security/compliance, cost model, and service choices (Step Functions vs Airflow, Lambda vs Glue, AgentCore vs self-hosted Strands).
 
 ## 6. Where AI Fits — and Where It Doesn't
 
@@ -323,7 +369,7 @@ The brief explicitly invites a "considered and rejected" narrative. Each below s
 
 ## 8. Honest Framing of "Eliminate"
 
-The brief asks how to *completely eliminate* the problem. A credible answer doesn't promise zero breaks.
+The [strategic goal](#strategic-goal) above states the end game in one place; this section defends it. A credible answer doesn't promise zero breaks.
 
 Structural fixes drive **break volume** down by orders of magnitude:
 - **Standard identifiers.** FIGI / ISIN / CUSIP at the source kills every `identifier_ambiguous` break — both "Alphabet Inc" and "Berkshire Hathaway Class A Inc" in this dataset disappear.
@@ -333,6 +379,8 @@ Structural fixes drive **break volume** down by orders of magnitude:
 But corporate actions get mis-applied, custodians have outages, settlement has edge cases, and humans will always find new ways to enter the wrong number. Those **residual exceptions** are exactly what the Layer-2 agent owns. The right claim is: *eliminate the structural causes, manage the residual via agentic exception handling, and prove it with a falling break rate over time.* Not "drive it to zero."
 
 ## 9. Phased Roadmap
+
+The 18-month row (DynamoDB, Step Functions, streaming feeds) is specified in [architecture/production_design.md](architecture/production_design.md).
 
 | Horizon | Investment | What ships | Break-volume target |
 |---|---|---|---|
@@ -422,57 +470,6 @@ Two policy choices to defend: (1) `position_type_mismatch` and `identifier_ambig
 **How the harness wires in (sketch — not built).** `code/eval/` holds a `LabeledBreak[]` JSON corpus (initial size ~50 records seeded from historical breaks; grows monotonically as ops grades real production breaks), a `run_eval.py` that replays each labeled snapshot through the Layer-2 agent with deterministic-mode prompting (`temperature=0`, fixed seed), and a `report.py` that writes a CSV per release with the three metrics → every `break_type` → every `truth_root_cause`. A single GitHub Actions job invokes the harness on every PR that touches `code/agent.py`, `code/tools/`, the system prompt, or the pinned model id, and the job fails if any cell in the per-release CSV is below the bar above — *no model change, no prompt change, no tool change ships without passing*. This is the gating mechanism referenced in the §9 6-month roadmap row, not a separate program.
 
 The agent's `escalate` verdict is the safe default. Any break with no classification, low confidence, or a tool-call failure falls into `out/escalations.json` rather than `out/resolved_breaks.json`.
-
-## 12. What I'd Do Next
-
-**Given another two weeks (single engineer, no infra ask):**
-1. Promote the in-line dict fixtures in `get_recent_trades` and `lookup_corporate_actions` (now covering every break in the ledger) to a SQLite-backed loader so the agent's evidence persists across runs and ops can grow the corpus without touching Python.
-2. Author the eval harness — 20-50 historical break records with hand-graded ideal verdicts — and run the agent against them for a precision/recall baseline per `break_type`.
-3. Add a `out/report.csv` for the ops team (the human-readable summary listed in [.kiro/steering/tech.md](../.kiro/steering/tech.md)).
-4. Re-evaluate the `AMBIGUITY_EPSILON` borderline case for BRK.A with a richer master that distinguishes share classes via FIGI; document whether the epsilon should move or whether the master fix is the right answer.
-
-**Given another two quarters (small team, infra budget):**
-1. Stand up the production stack from §5 / §9 — AgentCore + DynamoDB + Step Functions + EventBridge → Slack — wired to a single custodian for a pilot fund.
-2. Negotiate FIGI/ISIN on inbound files with that one custodian. Measure the `identifier_ambiguous` rate before and after.
-3. Plumb Langfuse + Bedrock token-usage metrics into CloudWatch; alarm on the cost ceiling and on per-tool latency.
-4. Build the labeled eval set into a CI gate — no model or prompt change ships without passing the precision/recall bar.
-
----
-
-## Repository Layout
-
-```text
-grayscale-project/
-  README.md
-  Instructions.md
-  pyproject.toml
-  uv.lock
-  custodian_a.csv
-  custodian_b.csv
-  securities_reference.csv
-  code/
-    models.py
-    pipeline/
-      ingest.py
-      reconcile.py
-    tools/
-      securities.py
-      trades.py
-      corporate_actions.py
-      classification.py
-    agent.py
-    run.py
-    tests/
-  out/
-    raw_breaks.json
-    data_quality.json
-    sampleout.txt
-    resolved_breaks.json
-    escalations.json
-  architecture/
-    low_level_architecture.mmd
-    low_level_architecture.png
-```
 
 ## How to Run
 
