@@ -103,13 +103,29 @@ class Break(BaseModel):
     ingest_warnings: list[IngestWarning] = Field(default_factory=list)
 
 
+class BreakRecommendation(BaseModel):
+    """Layer 2 disposition recommendation for a single break.
+
+    Recommendations are proposals for ops — not ledger mutations. The agent
+    records a disposition; humans or downstream systems act on approval.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    break_id: str = Field(min_length=8)
+    disposition: Literal["recommend_clear", "recommend_investigate", "require_human"]
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str
+    auto_extracted: bool = False
+
+
 class RunSummary(BaseModel):
     """Stdout-formatted run summary; full mode includes cost fields."""
 
     total_breaks: int = Field(ge=0)
     breaks_by_type: dict[str, int] = Field(default_factory=dict)
-    auto_cleared_count: int | None = None  # None in Layer-1-only
-    escalated_count: int | None = None
+    recommend_clear_count: int | None = None  # None in Layer-1-only
+    human_review_count: int | None = None
     tokens_input: int | None = None
     tokens_output: int | None = None
     estimated_cost_usd: float | None = None

@@ -17,10 +17,10 @@ from typing import Any
 from strands import Agent, tool
 from strands.models.bedrock import BedrockModel
 
-from code.models import ArtifactMetadata, Break
+from code.models import ArtifactMetadata, Break, BreakRecommendation
 from code.pipeline.reconcile import write_envelope
-from code.tools.classification import build_classify_break_tool
 from code.tools.corporate_actions import lookup_corporate_actions
+from code.tools.recommendation import build_recommend_disposition_tool
 from code.tools.securities import IdentifierResolver
 from code.tools.trades import get_recent_trades
 
@@ -34,14 +34,15 @@ BEDROCK_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 # System prompt scopes the agent to break-investigation only. The agent
 # may call lookup_security, get_recent_trades, lookup_corporate_actions,
-# and MUST call classify_break exactly once with its final verdict.
+# and MUST call recommend_disposition exactly once with its final disposition.
 SYSTEM_PROMPT = """You are a securities reconciliation analyst.
-For each break you receive, decide whether it can be auto-cleared, needs
-further investigation, or must be escalated to a human. Use the available
+For each break you receive, recommend whether ops can clear it, should
+investigate it once, or must have a human review it. Use the available
 tools to gather evidence (recent trades, corporate actions, security
-master lookups). End every turn by calling classify_break() exactly once
-with your verdict, a confidence in [0,1], and a one-sentence rationale
-that cites the specific tool outputs you relied on."""
+master lookups). End every turn by calling recommend_disposition() exactly
+once with your disposition (recommend_clear, recommend_investigate, or
+require_human), a confidence in [0,1], and a one-sentence rationale that
+cites the specific tool outputs you relied on."""
 
 
 def build_lookup_security_tool(resolver: IdentifierResolver):
@@ -80,26 +81,29 @@ def build_lookup_security_tool(resolver: IdentifierResolver):
 class AgentRunResult:
     """Aggregated output of iterating the agent over a break set."""
 
-    resolved: list[dict]
-    escalations: list[dict]
+    agent_recommendations: list[dict]
+    human_review: list[dict]
     tokens_input: int
     tokens_output: int
     missing_turns: int
 
 
-def _default_escalate(break_id: str, final_text: str) -> dict:
-    """Fallback verdict when the agent failed to call classify_break.
+def _default_require_human(break_id: str, final_text: str) -> dict:
+    """Fallback disposition when the agent failed to call recommend_disposition.
 
-    The primary verdict source is the captured-list populated by
-    ``build_classify_break_tool``; this function only fires when that
+    The primary disposition source is the captured-list populated by
+    ``build_recommend_disposition_tool``; this function only fires when that
     list is empty after the agent call (model went off-script, tool
-    invocation failed, etc.). Defaulting to ``escalate`` keeps the
+    invocation failed, etc.). Defaulting to ``require_human`` keeps the
     safety invariant: any uncategorised break lands in front of a human.
     """
-    rationale = final_text.strip() or "Agent produced no classification; defaulting to escalate."
+    rationale = (
+        final_text.strip()
+        or "Agent produced no disposition recommendation; defaulting to require_human."
+    )
     return {
         "break_id": break_id,
-        "verdict": "escalate",
+        "disposition": "require_human",
         "confidence": 0.0,
         "rationale": rationale,
         "auto_extracted": True,
@@ -130,6 +134,16 @@ def _accumulate_usage(result: Any, tokens_input: int, tokens_output: int) -> tup
     return tokens_input + (in_t or 0), tokens_output + (out_t or 0), True
 
 
+def _to_break_recommendation(record: dict) -> BreakRecommendation:
+    return BreakRecommendation(
+        break_id=record["break_id"],
+        disposition=record["disposition"],
+        confidence=record["confidence"],
+        rationale=record["rationale"],
+        auto_extracted=record.get("auto_extracted", False),
+    )
+
+
 def run_agent_over_breaks(
     breaks: list[Break],
     resolver: IdentifierResolver,
@@ -139,35 +153,35 @@ def run_agent_over_breaks(
     """Iterate the agent over every break and write the L2 artifacts.
 
     Constructs the Bedrock-backed Agent once, then calls it per-break so
-    each break gets its own conversation. Resolved/auto-cleared verdicts
-    go to ``out/resolved_breaks.json``; ``escalate`` verdicts go to
-    ``out/escalations.json``. Both files use the same ``write_envelope``
-    helper from Phase 5 so the metadata block matches the Layer-1
-    artifacts (Req 5 AC 4).
+    each break gets its own conversation. ``recommend_clear`` and
+    ``recommend_investigate`` dispositions go to ``out/agent_recommendations.json``;
+    ``require_human`` goes to ``out/human_review_queue.json``. Both files use
+    the same ``write_envelope`` helper from Phase 5 so the metadata block
+    matches the Layer-1 artifacts (Req 5 AC 4).
     """
     # The BedrockModel and the lookup_security tool are stateless across
-    # breaks and can be built once. classify_break is *per-break* because
-    # it closes over a fresh ``captured`` list each iteration so the
-    # runner can read the agent's verdict back out cleanly.
+    # breaks and can be built once. recommend_disposition is *per-break*
+    # because it closes over a fresh ``captured`` list each iteration so the
+    # runner can read the agent's disposition back out cleanly.
     model = BedrockModel(model_id=BEDROCK_MODEL_ID, region_name=BEDROCK_REGION)
     lookup_security = build_lookup_security_tool(resolver)
 
-    resolved: list[dict] = []
-    escalations: list[dict] = []
+    agent_recommendations: list[dict] = []
+    human_review: list[dict] = []
     tokens_input = 0
     tokens_output = 0
     missing_turns = 0
 
     for b in breaks:
         captured: list[dict] = []
-        classify_break = build_classify_break_tool(captured)
+        recommend_disposition = build_recommend_disposition_tool(captured)
         agent = Agent(
             model=model,
             tools=[
                 lookup_security,
                 get_recent_trades,
                 lookup_corporate_actions,
-                classify_break,
+                recommend_disposition,
             ],
             system_prompt=SYSTEM_PROMPT,
         )
@@ -176,7 +190,8 @@ def run_agent_over_breaks(
             f"Investigate break_id={b.break_id} for security_id={b.security_id!r} "
             f"on {b.as_of_date.isoformat()}. break_type={b.break_type}, "
             f"custodian={b.custodian}, raw_source_row={b.raw_source_row}. "
-            f"Decide auto_clear / investigate / escalate and call classify_break()."
+            f"Recommend recommend_clear, recommend_investigate, or require_human "
+            f"and call recommend_disposition()."
         )
         result = agent(prompt)
         tokens_input, tokens_output, had_usage = _accumulate_usage(
@@ -185,32 +200,29 @@ def run_agent_over_breaks(
         if not had_usage:
             missing_turns += 1
 
-        # Primary verdict source: whatever the agent passed to classify_break.
-        # Fallback: synthesize an escalate verdict so the break still lands
-        # somewhere safe if the agent went off-script.
-        verdict = captured[-1] if captured else _default_escalate(b.break_id, str(result))
-        if verdict["verdict"] == "escalate":
-            escalations.append(verdict)
+        # Primary disposition source: whatever the agent passed to recommend_disposition.
+        # Fallback: synthesize require_human so the break still lands somewhere safe
+        # if the agent went off-script.
+        record = captured[-1] if captured else _default_require_human(b.break_id, str(result))
+        if record["disposition"] == "require_human":
+            human_review.append(record)
         else:
-            resolved.append(verdict)
+            agent_recommendations.append(record)
 
-    # Cast dicts to a Pydantic-compatible shape via a dynamic wrapper so
-    # we can reuse write_envelope (which expects BaseModel records).
-    from pydantic import BaseModel
-
-    class _Verdict(BaseModel):
-        break_id: str
-        verdict: str
-        confidence: float
-        rationale: str
-        auto_extracted: bool = False
-
-    write_envelope(out_dir / "resolved_breaks.json", [_Verdict(**v) for v in resolved], metadata)
-    write_envelope(out_dir / "escalations.json", [_Verdict(**v) for v in escalations], metadata)
+    write_envelope(
+        out_dir / "agent_recommendations.json",
+        [_to_break_recommendation(r) for r in agent_recommendations],
+        metadata,
+    )
+    write_envelope(
+        out_dir / "human_review_queue.json",
+        [_to_break_recommendation(r) for r in human_review],
+        metadata,
+    )
 
     return AgentRunResult(
-        resolved=resolved,
-        escalations=escalations,
+        agent_recommendations=agent_recommendations,
+        human_review=human_review,
         tokens_input=tokens_input,
         tokens_output=tokens_output,
         missing_turns=missing_turns,

@@ -4,6 +4,12 @@
 
 This document describes the production AWS architecture that lifts the custodian reconciliation demo from a local-file pipeline into a fully managed, event-driven cloud system. The demo's two-layer design — a deterministic Python pipeline (Layer 1) and a Strands Agents SDK agentic resolver (Layer 2) — maps cleanly onto AWS managed services: S3 event notifications trigger an AWS Lambda normalization step, AWS Step Functions orchestrate the end-to-end workflow, Amazon Bedrock AgentCore Runtime hosts the Strands agent with microVM session isolation and consumption-based pricing, and AgentCore Gateway exposes the `@tool` functions as MCP-compatible endpoints backed by real data sources. DynamoDB stores break state with single-digit-millisecond reads; S3 Object Lock provides the WORM audit trail required for SEC 17a-4 compliance; CloudWatch and X-Ray deliver end-to-end observability across every layer.
 
+## Demo → production mapping
+
+The laptop demo consolidates Layer 2 judgment into one tool — `recommend_disposition` in [`code/tools/recommendation.py`](../code/tools/recommendation.py) — with disposition values `recommend_clear`, `recommend_investigate`, and `require_human`. Outputs are `out/agent_recommendations.json` and `out/human_review_queue.json`: **proposals for ops**, not ledger changes.
+
+Production splits the same intent across Gateway tools: evidence (`lookup_security`, `get_recent_trades`, …), `classify_break` + `propose_resolution` for structured reasoning, and threshold-gated `escalate_to_human` for HITL. Dollar and confidence gates apply before a recommend-clear is treated as approved; humans act in the system of record only after `SendTaskSuccess` on the approval callback.
+
 
 ## Architecture
 
@@ -65,7 +71,7 @@ flowchart TB
     end
 
     subgraph StateLayer["State & Audit"]
-        DDB["DynamoDB: recon-breaks\nPK: break_id / SK: as_of_date\nGSI: security_id + as_of_date"]
+        DDB["DynamoDB: recon-breaks\nPK: security_id\nSK: as_of_date#custodian\nGSI: as_of_date (ops dashboard)\nGSI: break_type (analytics)"]
         DDBSec["DynamoDB: recon-security-master\n(promoted from securities_reference.csv)"]
         DDBStreams["DynamoDB Streams\n→ Lambda → S3 Object Lock\n(immutable audit trail)"]
         DDB --> DDBStreams
@@ -123,7 +129,7 @@ Three purpose-separated buckets handle the file lifecycle:
 |---|---|---|
 | `recon-incoming` | Raw custodian CSV drops | Versioning enabled; lifecycle rule archives to S3 Glacier after 90 days; never deleted |
 | `recon-normalized` | Normalized position JSON emitted by IngestLambda | Standard storage; 30-day lifecycle to IA |
-| `recon-artifacts` | Break records, resolved breaks, escalations | S3 Object Lock (COMPLIANCE mode, 7-year retention) for SEC 17a-4 WORM compliance |
+| `recon-artifacts` | Break records, agent recommendations, human-review queue | S3 Object Lock (COMPLIANCE mode, 7-year retention) for SEC 17a-4 WORM compliance |
 
 S3 Event Notifications on `recon-incoming` fire an `ObjectCreated` event that triggers the Step Functions workflow. This replaces the demo's manual `uv run python -m code.run` invocation with a fully automated, file-arrival-driven pipeline.
 
@@ -169,6 +175,8 @@ The Strands agent (`code/agent.py`) is deployed to AgentCore Runtime via direct 
 
 The agent is configured with `BedrockModel(model_id="anthropic.claude-sonnet-4-20250514-v1:0", region_name="us-west-2")` and Bedrock Guardrails attached for PII redaction, denied topics, and prompt injection defense.
 
+**Service maturity and fallback path**: AgentCore Runtime and Gateway are recently GA AWS services with a shorter operational track record than the rest of the stack (S3, Lambda, DynamoDB, Step Functions are all 10+ years in production). If AgentCore proves unstable in `us-west-2`, hits a regional GA gap at deploy time, or its consumption pricing drifts past the per-run budget, the named fallback is **self-hosted Strands on ECS Fargate** behind an ALB (IAM SigV4 inbound, CloudWatch + X-Ray trace plumbing wired manually), with a Lambda-Function-URL aggregator standing in for Gateway's MCP endpoint. The trade-off is real (container patching, autoscaling tuning, no native session-trace UI) but bounded — the agent's value lives in the `@tool` surface, so moving hosts is a hosting-layer migration, not a rewrite. The Layer-1-only fallback in `code/run.py` remains the worst-case backstop if neither agent-hosting option is available.
+
 **Reference**: [AgentCore Runtime documentation](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agents-tools-runtime.html)
 
 ### Amazon Bedrock AgentCore Gateway — Tool Exposure
@@ -188,12 +196,18 @@ Key Gateway properties:
 Two tables:
 
 **`recon-breaks`**
-- Partition key: `break_id` (stable SHA-256 hash of `as_of_date|security_id|custodian`)
-- Sort key: `as_of_date`
-- GSI: `security_id` + `as_of_date` for break history queries per security
-- Stores: Break records (from ReconcileLambda), ResolvedBreak records (from AgentCore), human decisions (from approval callbacks)
-- On-demand capacity mode — traffic is bursty (one daily run) and unpredictable
-- KMS encryption at rest
+
+Key design follows the access patterns, not the identity. The two hot paths are (1) the agent asking *"everything I know about SEC0001 across the last N days"* and (2) the ops dashboard asking *"all of today's breaks"*. Both must be single-digit-ms `Query` operations, not scans.
+
+- **Partition key:** `security_id` (or the literal `"__ambiguous__"` sentinel for `identifier_ambiguous` breaks where the resolver returned `None`). Serves the agent's hot path in single-digit-ms reads; sets the latency floor for per-break tool calls in Layer 2.
+- **Sort key:** `as_of_date#custodian` — composite, `#`-delimited (the canonical DynamoDB idiom for composite SKs). Supports prefix queries like *"all SEC0001 entries on 2026-01-02 across both custodians"* via `begins_with(SK, "2026-01-02#")`.
+- **Non-key attribute `break_id`:** the stable SHA-256 hash of `(as_of_date, security_id, custodian)` emitted by the Reconciler. Still used for correlation against `out/raw_breaks.json` and for the §Correctness Properties Property 7 idempotency guarantee — re-runs write to the same `(PK, SK)` item and update in place, so duplicates are still structurally impossible.
+- **Ambiguous-break edge case:** when `security_id is None`, the Reconciler writes with `PK="__ambiguous__"` and `SK=as_of_date#custodian#sha256(raw_query)[:12]`. The extra `sha256(raw_query)[:12]` suffix on the SK keeps multiple ambiguous rows on the same day distinguishable (the case-study fixture has two — `"Alphabet Inc"` and `"Berkshire Hathaway Class A Inc"`). Ambiguous breaks remain queryable by date via the `as_of_date-index` GSI without polluting the resolved-security partition space.
+- **GSI `as_of_date-index`:** PK=`as_of_date`, SK=`security_id`, projection `ALL`. Powers the daily ops dashboard (*"all of today's breaks, sorted by security"*). Single `Query` returns the whole day's break ledger.
+- **GSI `break_type-index`:** PK=`break_type`, SK=`as_of_date`, projection `ALL`. Powers class-level analytics (*"`quantity_mismatch` rate over the quarter"*) with a single `Query` plus an SK range filter.
+- **Stores:** Break records (from ReconcileLambda), ResolvedBreak records (from AgentCore), human decisions (from approval callbacks).
+- **On-demand capacity mode** — traffic is bursty (one daily run) and unpredictable.
+- **KMS encryption at rest** with a customer-managed key; key rotation enabled.
 
 **`recon-security-master`**
 - Promoted from `securities_reference.csv`
@@ -209,7 +223,7 @@ When the agent's `escalate_to_human` tool fires, it emits an EventBridge event. 
 - **AWS Chatbot → Slack**: ops team receives a structured Slack message with break details, agent reasoning, and an approval/reject button. The button posts back to an API Gateway endpoint that calls `SendTaskSuccess` on the Step Functions execution.
 - **ServiceNow**: an SNS subscription creates a ServiceNow incident with the break record attached.
 
-Dollar threshold and confidence threshold are both required for auto-clear. The agent only calls `escalate_to_human` when either threshold is not met — this is enforced at the tool boundary, not via prompting.
+Dollar threshold and confidence threshold are both required before a recommend-clear is approved for booking. The agent only calls `escalate_to_human` when either threshold is not met — this is enforced at the tool boundary, not via prompting.
 
 ### CloudWatch + X-Ray — Observability
 
@@ -218,8 +232,8 @@ Every Lambda function and AgentCore Runtime session emits structured JSON logs w
 | Metric | Description |
 |---|---|
 | `BreaksDetected` | Total breaks emitted by ReconcileLambda |
-| `BreaksAutoCleared` | Breaks resolved by the agent without escalation |
-| `BreaksEscalated` | Breaks routed to human review |
+| `BreaksRecommendClear` | Breaks where the agent recommended clear without HITL routing |
+| `BreaksRequireHuman` | Breaks routed to human review |
 | `TokensConsumed` | Total Bedrock tokens used per run |
 | `CostUSD` | Estimated Bedrock cost per run |
 
@@ -248,7 +262,7 @@ Step-by-step from custodian file drop to resolved break:
 
 4. **Reconcile (ReconcileLambda)**: The Lambda function runs `pipeline/reconcile.py` logic. It reads normalized positions from `recon-normalized`, queries `recon-security-master` DynamoDB for identifier resolution, performs the cross-custodian join, and emits `Break` records. Break records are written to DynamoDB `recon-breaks` and to `recon-artifacts` S3 (Object Lock). The `data_quality.json` artifact is also written to `recon-artifacts`.
 
-5. **Agent invocation (AgentCoreInvoke)**: Step Functions invokes the AgentCore Runtime session with the list of `break_id` values from the current run. The Strands agent iterates over each break, calling tools through the AgentCore Gateway MCP endpoint. For each break, the agent calls `lookup_security`, then one or more of `get_recent_trades`, `get_corporate_actions`, `get_fx_rate`, `get_settlement_status` to gather evidence, then `classify_break` and `propose_resolution`. If confidence is below threshold or the dollar value exceeds the auto-clear limit, the agent calls `escalate_to_human`.
+5. **Agent invocation (AgentCoreInvoke)**: Step Functions invokes the AgentCore Runtime session with the list of `break_id` values from the current run. The Strands agent iterates over each break, calling tools through the AgentCore Gateway MCP endpoint. For each break, the agent calls `lookup_security`, then one or more of `get_recent_trades`, `get_corporate_actions`, `get_fx_rate`, `get_settlement_status` to gather evidence, then `classify_break` and `propose_resolution` (production split of the demo's single `recommend_disposition` tool). If confidence is below threshold or the dollar value exceeds the recommend-clear ceiling, the agent calls `escalate_to_human`.
 
 6. **Tool execution**: Each tool call from the agent hits the AgentCore Gateway endpoint (IAM SigV4 authenticated). The Gateway routes the call to the appropriate Lambda target. In production, `get_recent_trades` calls the OMS API; `get_corporate_actions` calls the corporate action vendor API; `get_fx_rate` calls the FX rate service. `lookup_security` queries DynamoDB `recon-security-master` directly.
 
@@ -256,7 +270,7 @@ Step-by-step from custodian file drop to resolved break:
 
 8. **Notification / HITL**: For escalated breaks, the `escalate_to_human` tool emits an EventBridge event. The EventBridge rule routes to SNS → Slack (via AWS Chatbot) and/or ServiceNow. The Step Functions execution pauses at the `NotifyOrApprove` state, waiting for a `SendTaskSuccess` callback. The ops team reviews the break in Slack or ServiceNow, approves or rejects, and the callback resumes the workflow.
 
-9. **Completion**: The Step Functions execution completes. CloudWatch custom metrics are emitted for the run (`BreaksDetected`, `BreaksAutoCleared`, `BreaksEscalated`, `TokensConsumed`, `CostUSD`). A CloudWatch Alarm fires if the workflow did not complete before the market-open SLA.
+9. **Completion**: The Step Functions execution completes. CloudWatch custom metrics are emitted for the run (`BreaksDetected`, `BreaksRecommendClear`, `BreaksRequireHuman`, `TokensConsumed`, `CostUSD`). A CloudWatch Alarm fires if the workflow did not complete before the market-open SLA.
 
 
 ## Glue vs Lambda Decision
@@ -337,10 +351,12 @@ Each Step Functions execution that invokes AgentCore creates one Runtime session
 | Component | Permissions |
 |---|---|
 | IngestLambda | `s3:GetObject` on `recon-incoming/*`; `s3:PutObject` on `recon-normalized/*`; `logs:CreateLogGroup`, `logs:PutLogEvents` |
-| ReconcileLambda | `s3:GetObject` on `recon-normalized/*`; `s3:PutObject` on `recon-artifacts/*`; `dynamodb:PutItem`, `dynamodb:UpdateItem` on `recon-breaks`; `dynamodb:GetItem`, `dynamodb:Query` on `recon-security-master` |
-| AgentCore Runtime | `bedrock-agentcore:InvokeGateway` on the Gateway ARN; `bedrock:InvokeModel` on the Claude Sonnet model ARN; `dynamodb:UpdateItem` on `recon-breaks` |
+| ReconcileLambda | `s3:GetObject` on `recon-normalized/*`; `s3:PutObject` on `recon-artifacts/*`; `dynamodb:PutItem`, `dynamodb:UpdateItem`, `dynamodb:Query` on `recon-breaks`; `dynamodb:Query` on `recon-breaks/index/as_of_date-index` and `recon-breaks/index/break_type-index`; `dynamodb:GetItem`, `dynamodb:Query` on `recon-security-master` |
+| AgentCore Runtime | `bedrock-agentcore:InvokeGateway` on the Gateway ARN; `bedrock:InvokeModel` on the Claude Sonnet model ARN; `dynamodb:UpdateItem`, `dynamodb:Query` on `recon-breaks` (agent hot-path query by `security_id`); `dynamodb:Query` on `recon-breaks/index/as_of_date-index` and `recon-breaks/index/break_type-index` (evidence-gathering queries by date or break_type) |
 | Tool Lambdas | Per-tool: `dynamodb:GetItem` on `recon-security-master` (lookup_security); `secretsmanager:GetSecretValue` for API credentials (trades, corp actions, FX); `events:PutEvents` (escalate_to_human) |
 | DynamoDB Streams Lambda | `s3:PutObject` on `recon-artifacts/*` with Object Lock headers |
+
+**GSI ARN gotcha:** DynamoDB Global Secondary Index ARNs are distinct resources in IAM (`table-arn/index/index-name`). A table-level grant does **not** implicitly extend to GSIs — each GSI must be listed explicitly in the role's resource scope. This catches even experienced AWS engineers because the AWS console UI presents GSIs as "part of" the table.
 
 ### Secrets Management
 
@@ -377,33 +393,52 @@ Lambda functions run in a private VPC subnet with no internet gateway. Outbound 
 
 ## Scalability
 
-### Current Baseline
+The 20-positions / 14-breaks volumes used in the §Cost Model and the per-run estimates are the interview-fixture numbers from the upstream demo — not a production target. Real-world scaling reasoning starts at mid-size-asset-manager volume and walks up two orders of magnitude. Every subsection below assumes a **1% break rate** on the incoming position volume (the conservative upper end of the industry-typical 0.1-0.5% range from the Finantrix daily-recon reference; using 1% as the planning number keeps the architecture honest against a noisier custodian feed).
 
-At current volume (~20 positions/day across 2 custodians, ~14 breaks/day), the architecture is significantly over-provisioned. Lambda cold starts are the dominant latency factor; the entire pipeline completes in under 2 minutes.
+| Tier | Positions/day | Breaks/day | Real-world analog |
+|---|---|---|---|
+| Production Baseline | 100,000 | 1,000 | Mid-size asset manager |
+| Next | 1,000,000 | 10,000 | Large multi-fund family / mid-tier prime broker |
+| Upper | 10,000,000 | 100,000 | Global custodian / top-10 prime broker |
 
-### 10x Volume (~200 positions/day, ~140 breaks/day)
+### Production Baseline — 100,000 positions/day, 1,000 breaks/day
 
-No architectural changes required. Lambda scales automatically. DynamoDB on-demand capacity handles the increased write throughput. AgentCore Runtime provisions additional microVMs in parallel if multiple runs are triggered simultaneously. The Step Functions workflow is unchanged.
+The reference architecture as drawn handles this tier without service swaps. Per-layer bottleneck check:
 
-The main consideration at 10x is Bedrock token cost: 140 breaks × ~5,000 tokens/break = ~700,000 tokens/run. At Claude Sonnet 4 pricing ($3/M input, $15/M output), this is approximately $2–4/run. Still well within a reasonable daily budget.
+- **IngestLambda (per custodian).** 100k CSV rows is ~5 seconds in pandas and ~50 MB resident. Fits comfortably in a 512 MB / 5-minute Lambda. Cold start dominates the wall time.
+- **ReconcileLambda.** O(N+M) dict-based join over ~100k positions is <30 seconds and <500 MB resident. Still Lambda territory.
+- **DynamoDB writes.** 1,000 break items per run is trivial for on-demand mode — the account-level default of 4,000 WCU/s is barely exercised (<1%).
+- **AgentCore Runtime is the bottleneck.** 1,000 breaks at ~10 seconds per break sequential is 2.7 hours — fails the market-open SLA. **Required architectural change:** Step Functions Map state with `maxConcurrency` ~50 invoking parallel AgentCore Runtime sessions; each session handles ~20 breaks; total wall time drops to ~3 minutes. AgentCore's microVM-per-session isolation makes this fan-out safe.
+- **Cost.** Bedrock token spend dominates: ~1,000 breaks × ~5,000 tokens/break × Claude Sonnet on-demand pricing ≈ **$30/run**. Infra cost (Lambda, DDB, S3, Step Functions) is rounding error. Daily run cost well under $50 — green-light.
 
-### 100x Volume (~2,000 positions/day, ~1,400 breaks/day)
+At this tier, structural fixes (FIGI/ISIN at the source) would cut the break population by perhaps 30-50% — worth doing, but the agent handles the residual without any architecture change.
 
-At this scale, the normalization step may benefit from parallelization. The Step Functions workflow can be updated to use a Map state that fans out IngestLambda invocations per custodian file in parallel. ReconcileLambda processes the merged normalized output.
+### Next tier — 1,000,000 positions/day, 10,000 breaks/day
 
-The agent invocation becomes the bottleneck. Options:
-1. **Parallel agent sessions**: use a Step Functions Map state to invoke multiple AgentCore Runtime sessions in parallel, each processing a subset of breaks. AgentCore's microVM isolation makes this safe.
-2. **Haiku for classification, Sonnet for resolution**: use Claude Haiku (faster, cheaper) for the `classify_break` step and only invoke Sonnet for `propose_resolution` on breaks that clear the classification threshold. This reduces token cost by ~60% at the cost of a two-pass agent loop.
+Several layers start creaking. Each one has a named AWS-native remediation:
 
-DynamoDB on-demand capacity continues to scale automatically. S3 has no practical throughput limit at this volume.
+- **IngestLambda hits its ceiling.** 1M CSV rows is ~500 MB resident in pandas and 5-15 seconds processing; at the edge of the 10 GB Lambda memory cap once intermediate data structures inflate. **Inflection point — migrate ingest to AWS Glue Python Shell jobs** (not PySpark). Glue Python Shell is the right tool here: more CPU/memory headroom than Lambda, no Spark cluster cold start, and the existing `pipeline/ingest.py` Python deploys nearly unchanged. Reserve Glue PySpark for the upper tier where partitioned parallelism actually pays.
+- **ReconcileLambda.** Same memory pressure, same migration to Glue Python Shell. The dict-based join logic is unchanged; the runtime just has more headroom.
+- **DynamoDB.** 10,000 writes per run; on-demand can throttle on burst writes at this volume. Switch to **provisioned capacity with autoscaling** (~30% cheaper at steady state) or pre-warm the table before the daily run. **Security master inflation:** at 1M positions the underlying universe is likely 10k-100k securities (vs ~20 in the demo). DynamoDB lookups stay single-digit-ms, but cache the security master in the Lambda handler as a warmed dict on cold start (~5 MB) to cut tool-call latency.
+- **AgentCore.** 10,000 breaks × ~10 seconds sequential = 28 hours, impossible. Map concurrency of ~100 parallel AgentCore sessions completes in ~17 minutes — tight against market open. **Cost optimization at this tier:** Haiku for `classify_break` (~10x cheaper than Sonnet), Sonnet only for `propose_resolution` on the subset that needs deep reasoning. Two-pass agent loop, ~50-70% Bedrock cost reduction depending on the rule-out rate of the cheap first pass.
+- **Cost.** Without Haiku optimization: ~$300/run. With Haiku: ~$100-150/run. Still well within daily budget for an institution at this scale.
 
-### 1,000x Volume (~20,000 positions/day, ~14,000 breaks/day)
+Multi-region DR becomes important at this tier, not optional. A single-region Bedrock outage at 7am ET costs real money and reputation when a large fund family depends on the run completing before market open.
 
-At this scale, the Lambda normalization step should be migrated to AWS Glue ETL (see Glue vs Lambda Decision). Glue's job bookmarks prevent reprocessing of already-ingested files, and the Data Catalog tracks schema evolution across custodians.
+### Upper tier — 10,000,000 positions/day, 100,000 breaks/day
 
-The agent layer requires a fundamentally different approach: rather than processing breaks sequentially in a single session, a distributed fan-out pattern is needed. Each break becomes an independent Step Functions execution, with AgentCore Runtime sessions processing breaks in parallel. A DynamoDB-based coordination table tracks run-level aggregates (total breaks, auto-cleared count, escalation count) across the parallel executions.
+Above this volume the architecture *shape* changes, not just the parameters:
 
-At this volume, the structural fixes (real-time feeds, FIGI/ISIN/CUSIP identifiers, STP) become economically compelling — they reduce the break population by orders of magnitude before the agent ever sees it.
+- **Daily batch DAG no longer fits.** At this volume custodian feeds are typically continuous through the trading day rather than a single EOD drop. Migrate from a Step Functions Standard Workflow batch orchestration to a **streaming model**: Kinesis Data Streams as the ingest backbone, Lambda consumers (or Kinesis Data Firehose to Glue) for normalization, a DynamoDB-based coordination table tracking run-level state. Breaks emit continuously as positions arrive, not at a single 7am batch.
+- **Ingest moves to Glue PySpark with auto-scaling DPUs, or EMR Serverless.** Glue Python Shell is no longer enough; the partitioned parallelism that Spark provides starts paying for its cold-start cost. The transform code becomes a few-screen PySpark job — the existing ingest logic translates directly.
+- **DynamoDB hot-partition risk.** 100,000 writes/day averages 1.15/s but bursts at file-arrival waves. The `PK=security_id` design (from the corrected key schema in §State Layer) distributes well on the *typical* workload, but on a major corp-action day a single security can generate thousands of breaks across sub-accounts — a classic hot partition. **Mitigation:** write-shard the hot partition by suffixing `PK=security_id#shardN` where N is a hash bucket (8-16 buckets), and query-fan-out at read time. Standard DDB hot-partition pattern.
+- **AgentCore economics break.** 100,000 breaks × ~$0.03/break (with Haiku-first optimization) = ~$3,000/day if the agent touches every break. Unsustainable. **The agent stops being the primary actor.** A deterministic rules engine — built from the labeled eval-harness data (see §11 of the README) — must pre-filter 90%+ of breaks. High-confidence settlement-timing breaks auto-clear without LLM involvement. The agent handles only the long tail (~10% = 10,000 breaks/day), reducing Bedrock spend to ~$300-500/day.
+- **Multi-region active-active is mandatory, not optional.** A Bedrock regional outage at 7am ET is operationally fatal at this scale — the deferred DR plan (primary `us-west-2`, secondary `us-east-1`, DynamoDB Global Tables, S3 CRR, ~30 min RTO / ~5 min RPO) becomes a hard requirement, with the Layer-1-only fallback the demo's `code/run.py` already implements as the worst-case backstop.
+- **The §8 "Honest Framing of Eliminate" from the README applies at this scale.** The only sustainable answer is structural: FIGI/ISIN everywhere, real-time custodian feeds via FIX or vendor APIs, STP from the OMS. These cut the break population by orders of magnitude *before* the agent sees it. The agent stays in the architecture as a long-tail safety net for the irreducible residual exceptions (corp actions, custodian errors, settlement edge cases), not as the main workflow.
+
+### Summary
+
+The reference architecture (Step Functions + Lambda + AgentCore + DynamoDB) scales cleanly through the **baseline tier** with no service swaps. Through the **next tier** it stays intact with named optimizations — Glue Python Shell for ingest, provisioned DynamoDB capacity, Lambda-layer security-master caching, Haiku-for-classification with Sonnet-for-resolution. Above the **upper tier** the orchestration model itself shifts from batch to streaming, the economics force a deterministic rule-based pre-filter, and structural fixes (FIGI/ISIN, STP, real-time feeds) become economically mandatory. The agent stays in the architecture across all three tiers but moves from being the primary actor at baseline to a long-tail safety net at scale.
 
 
 ## Cost Model
@@ -470,6 +505,48 @@ All prices are AWS list prices for `us-west-2` as retrieved from the AWS Pricing
 - KMS: ~$1/month (2 keys × $1/month)
 - **Total monthly estimate: ~$18/month**
 
+### Cost at Production Scale (Mid-Size and Large Asset Manager)
+
+The demo numbers above are the interview-fixture volume. This subsection maps the §Scalability tiers onto cost so the *"is this affordable at scale?"* question gets answered alongside the architecture question. Pricing assumptions match the demo subsection: Claude Sonnet on-demand at $3/M input and $15/M output per the [Bedrock pricing page](https://aws.amazon.com/bedrock/pricing/); Claude Haiku at $0.25/M input and $1.25/M output (used in the optimized rows). Per-break token budget held constant across tiers at ~3,000 input + ~1,500 output for Sonnet — matches the demo's per-break assumption.
+
+| Cost Component | Demo (14 breaks) | Mid-Size (1k breaks) | Large (10k breaks) |
+|---|---|---|---|
+| Compute (Lambda / Glue Python Shell) | $0.0003 | $0.007 | $0.11 |
+| Bedrock (Sonnet only) | $0.44 | $31.50 | $315.00 |
+| Bedrock (with Haiku-first optimization) | n/a | ~$12-15 | ~$100 |
+| DynamoDB | $0.0001 | $0.006 (on-demand) | $0.50 (provisioned + autoscale) |
+| S3 | $0.0001 | $0.0005 | $0.01 |
+| Step Functions | $0.00025 | $0.025 | $0.25 |
+| AgentCore Runtime | ~$0.03 | ~$1 | ~$10 |
+| **Total per run (Sonnet only)** | **~$0.47** | **~$33** | **~$325** |
+| **Total per run (Haiku optimized)** | **n/a** | **~$13-17** | **~$110** |
+| **Per-position cost** | $0.024 | $0.00033 | $0.000325 |
+| **Monthly (1 run/day, Haiku optimized)** | **~$14** | **~$400-500** | **~$3,300-3,500** |
+
+#### Mid-Size (100k positions/day, 1k breaks)
+
+- **Bedrock continues to dominate (~95% of total).** Same pattern as the demo, just scaled. The per-break cost is roughly constant (~$0.03 with Sonnet, ~$0.01-0.015 with Haiku-first), so total Bedrock cost scales linearly with break count.
+- **No service swaps required.** Lambda still works for ingest and reconcile per the §Scalability analysis (100k rows / ~5s / ~50 MB). DynamoDB stays on on-demand mode. The only new line item is the Step Functions Map state cost ($0.025/run for ~1,000 Map iterations at $0.000025 per transition).
+- **Haiku-first cuts the all-in run cost by ~60%.** From ~$33 down to ~$13-17 depending on the classification-vs-resolution split. Annual savings at 1 run/day: ~$5,800.
+
+#### Large (1M positions/day, 10k breaks)
+
+- **Compute migration to Glue Python Shell** (per §Scalability) costs slightly more than Lambda would in absolute terms ($0.11 vs the ~$0.05 Lambda would cost at this volume *if* it had the memory headroom) but stays comfortably under any reasonable threshold. The migration is driven by the memory ceiling, not by cost.
+- **DynamoDB switches to provisioned + autoscaling.** Estimate based on ~100 WCU baseline at $0.00013/WCU-hour over a sustained 1-hour daily run window: ~$0.30/day baseline + burst. Provisioned mode runs ~30% cheaper than on-demand at this steady-state throughput.
+- **Step Functions Map cost rises with break count** — 10k Map iterations × $0.000025 = $0.25/run. Still trivial in absolute terms.
+- **AgentCore Runtime is the only line item with material estimation uncertainty.** Pricing is consumption-based on active processing time; at 10k breaks across ~100 parallel sessions and ~30s active per break, total session-seconds ≈ 5,000. The ~$10/run estimate is conservative; could be half that depending on the actual per-session-second rate (confirm via the [AgentCore pricing page](https://aws.amazon.com/bedrock/agentcore/pricing/) before committing to a budget).
+- **Haiku-first becomes economically forcing, not optional.** $315/run without it is borderline acceptable; $100/run with it sits squarely in the "ops team's discretionary budget" zone. Annual savings at 1 run/day: ~$78,000.
+
+#### Upper tier note (10M positions/day, 100k breaks)
+
+At the §Scalability Upper tier, if the agent touches every break the Bedrock bill is ~$3,150/day on Sonnet-only or ~$1,000/day with Haiku-first — either way operationally untenable for a single fund's daily recon (the Haiku-first number is ~$30k/month for one fund). This is exactly why the §Scalability Upper-tier discussion requires a deterministic rules-based pre-filter to remove ~90% of breaks before they ever reach the agent. With that pre-filter the agent processes ~10k breaks/day and the cost shape collapses back to the Large tier above (~$100/run, ~$3,300-3,500/month). The rules-engine cost itself is negligible — it's stateless Lambda over the same DynamoDB break ledger.
+
+#### Pattern observations
+
+1. **Bedrock dominates at every scale** (>90% of total run cost). Infrastructure costs are noise; cost optimization is fundamentally Bedrock optimization (model tiering, prompt caching, token budgeting).
+2. **Per-position cost falls with scale** — $0.024/position at demo, $0.00033 at Mid-Size, $0.000325 at Large. Because cost scales with *breaks* (~1% of positions) and per-break cost is roughly constant, larger funds get a structural per-position cost advantage.
+3. **The break rate is the dominant cost driver.** Cost is fundamentally `~$0.03 × (break_rate × positions_per_day)`. A custodian-feed improvement that drops the break rate from 1% to 0.5% halves the monthly Bedrock bill at every tier. This is one quantitative reason the §8 "structural fixes" argument from the README is also a cost argument — FIGI/ISIN and STP are not just data-quality improvements, they are line-item cost reductions.
+
 ### Cost Optimization Levers
 
 1. **Bedrock Prompt Caching**: if the system prompt and security master context are repeated across breaks in the same session, prompt caching can reduce input token cost by 50–80%.
@@ -532,7 +609,12 @@ The production deployment uses the same Pydantic v2 models defined in `code/mode
 
 ```python
 # DynamoDB item structure for recon-breaks table
-# PK: break_id (str)  SK: as_of_date (str, ISO 8601)
+# PK: security_id (str, or "__ambiguous__" sentinel when identifier_ambiguous)
+# SK: as_of_date#custodian (str, composite; for ambiguous breaks append
+#     "#sha256(raw_query)[:12]" to keep multiple ambiguous rows on the
+#     same day distinguishable)
+# break_id is a non-key attribute — still the stable SHA-256 hash for
+# idempotency (Property 7) and correlation with out/raw_breaks.json.
 {
     "break_id":           str,   # SHA-256 hash of (as_of_date|security_id|custodian)
     "as_of_date":         str,   # ISO 8601 date

@@ -220,11 +220,11 @@ Stop-points that still deliver value: end of Phase 6 (working Layer 1, both JSON
   - Construct `BedrockModel(model_id=..., region_name="us-west-2")` per design.md §3 Agent_Runtime, then build an `Agent` with the `@tool` set listed in #[[file:.kiro/steering/tech.md]] Agent Tools.
   - Tool implementations may be mocked from in-line dicts. The `lookup_security` `@tool` SHALL be a thin wrapper around the Layer-1 `IdentifierResolver` from `code/tools/securities.py`.
   - _Acceptance:_ Req 7 AC 3, 4
-  - _Files:_ `code/agent.py`, `code/tools/trades.py`, `code/tools/corporate_actions.py`, `code/tools/classification.py`
+  - _Files:_ `code/agent.py`, `code/tools/trades.py`, `code/tools/corporate_actions.py`, `code/tools/recommendation.py`
 
 - [x] 37. (Optional — time-permitting) Implement TokenUsage capture and missing-usage warning
   - Iterate the agent over the raw break set per design.md §5.E. For each turn, accumulate `input_tokens`/`output_tokens` or increment `missing_turns` (Req 6 AC 4).
-  - Write `out/resolved_breaks.json` and `out/escalations.json` through the same `write_envelope` helper from Phase 5 (Req 5 AC 4).
+  - Write `out/agent_recommendations.json` and `out/human_review_queue.json` through the same `write_envelope` helper from Phase 5 (Req 5 AC 4).
   - _Acceptance:_ Req 5 AC 4; Req 6 AC 4; Req 7 AC 3
   - _Files:_ `code/agent.py`
 
@@ -244,7 +244,7 @@ Stop-points that still deliver value: end of Phase 6 (working Layer 1, both JSON
   - _Files:_ `code/run.py`
 
 - [x] 40. (Optional — time-permitting) Verify the Layer-2 path and its degradation
-  - With Bedrock creds: run `uv run python -m code.run` and confirm `out/resolved_breaks.json` exists with the metadata envelope; the `RunSummary` prints all seven fields from Req 6 AC 1.
+  - With Bedrock creds: run `uv run python -m code.run` and confirm `out/agent_recommendations.json` exists with the metadata envelope; the `RunSummary` prints all seven fields from Req 6 AC 1.
   - Without Bedrock creds: temporarily unset `AWS_PROFILE` / `AWS_ACCESS_KEY_ID` and re-run; confirm the run exits zero with the trimmed Layer-1-only summary.
   - _Acceptance:_ Req 6 AC 1, 2; Req 7 AC 3
   - _Files:_ (no new files; verification only)
@@ -267,7 +267,7 @@ Stop-points that still deliver value: end of Phase 6 (working Layer 1, both JSON
   - _Files:_ (no new files)
 
 - [x] 44. (Optional — if Phase 8 done and Bedrock creds present) Run the full demo smoke
-  - `uv run python -m code.run`; confirm `out/resolved_breaks.json` and the full cost summary line.
+  - `uv run python -m code.run`; confirm `out/agent_recommendations.json` and the full cost summary line.
   - _Acceptance:_ Req 6 AC 1, 2
   - _Files:_ (no new files)
 

@@ -17,9 +17,11 @@ The brief asks how to **completely eliminate** morning recon as a manual fire dr
 
 The fund's morning recon is two real problems wearing one label: **(a)** a deterministic data-shaping problem — different schemas, paren-negative shorts, four date formats, description-vs-ticker matching — and **(b)** an investigative problem — once a break is surfaced, ops has to pull trades, check the corp-action calendar, and decide whether to clear or escalate.
 
-These deserve different tools. I built **(a)** as a deterministic Python pipeline (`code/pipeline/`) that emits a canonical `Break` record and a structured `IngestWarning` for every coercion. I built **(b)** as an optional Strands agent on Bedrock Claude Sonnet 4.5 (`code/agent.py` + `code/run.py`) that calls four `@tool`s and ends each turn with a verdict. See [Tenets of design](#tenets-of-design) for the rules that keep the two layers separated.
+These deserve different tools. I built **(a)** as a deterministic Python pipeline (`code/pipeline/`) that emits a canonical `Break` record and a structured `IngestWarning` for every coercion. I built **(b)** as an optional Strands agent on Bedrock Claude Sonnet 4.5 (`code/agent.py` + `code/run.py`) that calls four `@tool`s and ends each turn with a disposition recommendation.
 
 The same approach is also a phased roadmap: today's slice automates the symptom, the next two quarters tackle the structural causes (FIGI/ISIN/CUSIP, real-time feeds), and the agent owns the residual exceptions that no structural fix can eliminate.
+
+Real-world securities workflows — multi-custodian feeds, heterogeneous schemas, corporate actions, settlement timing, and regulatory audit — are inherently complex. This case study scopes that complexity to a single EOD positions problem so the solution can be read as a worked example of first principles: **canonical data modeling** with visible coercion (§2), a **two-layer cell architecture** that isolates deterministic reconcile from agentic judgment (§5–§6), **cost-aware design** that keeps the hot path on milliseconds of CPU and bounds LLM spend to the exception queue (§10), and **failure isolation** at every boundary — Layer-1-only fallback, least-privilege steps in production, and human gates when evidence is thin (§11, [production design](architecture/production_design.md)). The five tenets below make those principles explicit and non-negotiable.
 
 ## Tenets of design
 
@@ -29,7 +31,7 @@ Five rules that govern the design of this pipeline.
 
 2. **Never silently rewrite source truth** — Every normalization is visible. When the data is ambiguous, the system surfaces the ambiguity instead of guessing.
 
-3. **The agent recommends; it does not act** — The agent gathers evidence and proposes a verdict. It does not update books, move money, or mutate custodian data. Unclear outcomes go to a human.
+3. **The agent recommends; it does not act** — The agent gathers evidence and records a **disposition recommendation** (`recommend_clear`, `recommend_investigate`, or `require_human`). It does not update books, move money, or mutate custodian data; artifacts in `out/agent_recommendations.json` and `out/human_review_queue.json` are proposals for ops, not ledger changes.
 
 4. **Every artifact must be auditable and reproducible** — Outputs carry provenance. Each break preserves what the custodian actually sent so ops can reconstruct and defend every decision.
 
@@ -198,7 +200,7 @@ grayscale-project/
       securities.py            # Identifier resolver (+ Layer 2 lookup_security tool)
       trades.py                # Mocked recent-trades blotter (@tool)
       corporate_actions.py     # Mocked corp-action calendar (@tool)
-      classification.py        # Agent verdict capture (@tool)
+      recommendation.py          # Agent disposition recommendation (@tool)
     agent.py                   # Layer 2: Strands agent on Bedrock Claude Sonnet 4.5
     run.py                     # Entrypoint: Layer 1 + Layer 2 + cost summary
     tests/                     # Acceptance tests for ingest, reconcile, resolver
@@ -206,8 +208,8 @@ grayscale-project/
     raw_breaks.json            # Layer 1 break ledger
     data_quality.json          # Layer 1 ingest-warning ledger
     sampleout.txt              # Example terminal log (Layer 1 + partial Layer 2)
-    resolved_breaks.json       # Layer 2 auto-cleared / investigated verdicts
-    escalations.json           # Layer 2 breaks requiring human review
+    agent_recommendations.json # Layer 2 recommend_clear / recommend_investigate
+    human_review_queue.json    # Layer 2 require_human dispositions
   architecture/
     low_level_architecture.mmd   # Mermaid source for section 5 demo diagram
     low_level_architecture.png   # Static export of section 5 demo diagram
@@ -270,13 +272,13 @@ flowchart TB
     end
 
     subgraph L2[Layer 2 - Agentic - Strands + Bedrock]
-        Agent[Agent_Runtime<br/>Sonnet 4.5 via BedrockModel<br/>tools: lookup, trades, corp_actions, classify]
+        Agent[Agent_Runtime<br/>Sonnet 4.5 via BedrockModel<br/>tools: lookup, trades, corp_actions, recommend]
         Cost[Cost_Reporter<br/>tokens + USD + runtime]
     end
 
     subgraph L2_Out[Layer 2 Outputs]
-        Resolved[out/resolved_breaks.json]
-        Esc[out/escalations.json]
+        Recs[out/agent_recommendations.json]
+        HITL[out/human_review_queue.json]
         Stdout[Run_Summary stdout<br/>'no book of record' line<br/>cost summary]
     end
 
@@ -309,13 +311,13 @@ Static export: [architecture/low_level_architecture.png](architecture/low_level_
 ### Layer 2 — agentic, for break investigation
 
 - **Entrypoint:** `uv run python -m code.run` (runs Layer 1 first, then attempts the agent)
-- **Outputs:** `out/resolved_breaks.json`, `out/escalations.json`, plus a cost summary on stdout
+- **Outputs:** `out/agent_recommendations.json`, `out/human_review_queue.json`, plus a cost summary on stdout
 - **Model:** Claude Sonnet 4.5 on Bedrock in `us-west-2` (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`)
 - **Tools (`@tool` decorator):**
   - `lookup_security` — wraps the Layer-1 resolver in [code/tools/securities.py](code/tools/securities.py); not duplicated, so Layer 1 and Layer 2 can never disagree about the master.
   - `get_recent_trades` — mocked OMS blotter in [code/tools/trades.py](code/tools/trades.py); covers SEC0001 / SEC0002 / SEC0006 / SEC0012 (quantity_mismatch settlement-timing stories), SEC0008 / SEC0011 (short SELL_SHORT pending T+1), and SEC0013 / SEC0015 (TRANSFER_IN from a prior custodian).
   - `lookup_corporate_actions` — mocked vendor calendar in [code/tools/corporate_actions.py](code/tools/corporate_actions.py); covers SEC0007 META (special dividend on the recon date) and SEC0014 BAC (merger consideration effective on the recon date).
-  - `classify_break` — factory-built per break in [code/tools/classification.py](code/tools/classification.py) and bound to a per-call captured-verdict list. The runner reads the agent's final verdict directly from that list; the synthetic `escalate` default fires only when the agent failed to invoke the tool at all (safety fallback, not the primary path).
+  - `recommend_disposition` — factory-built per break in [code/tools/recommendation.py](code/tools/recommendation.py) and bound to a per-call captured-disposition list. The runner reads the agent's final recommendation directly from that list; the synthetic `require_human` default fires only when the agent failed to invoke the tool at all (safety fallback, not the primary path).
 - **Graceful degradation:** Bedrock auth/transport failure is caught narrowly; the run prints the Layer-1-only summary and exits zero. The "no book of record" line prints in both modes.
 
 Verified in the dev sandbox without AWS credentials:
@@ -327,17 +329,17 @@ No book of record was supplied; reconciling custodian_a vs custodian_b only.
 Layer 2 unavailable (NoCredentialsError: Unable to locate credentials); running Layer-1-only.
 ```
 
-### Expected verdict distribution (Layer 2 against this dataset)
+### Expected disposition distribution (Layer 2 against this dataset)
 
 The mocked tool data plus the §11 auto-clear policy produce a real triage outcome rather than "everything escalates":
 
 | Verdict | Count | Securities |
 |---|---|---|
-| `auto_clear` | 4-5 | AAPL, MSFT, AMZN, V, TSLA (clean settlement-timing stories) |
-| `investigate` | 2-3 | META (corp-action + custodian gap), MA, SHOP (transfer-in stories ops should eyeball once) |
-| `escalate` | 6-8 | NVDA (position-type flip, never auto-clearable per §11), BRK.A (B-side ambiguous), GOOGL (no plausible evidence), JPM (judgement call on the short), BAC (merger needs human), 2 identifier_ambiguous rows |
+| `recommend_clear` | 4-5 | AAPL, MSFT, AMZN, V, TSLA (clean settlement-timing stories) |
+| `recommend_investigate` | 2-3 | META (corp-action + custodian gap), MA, SHOP (transfer-in stories ops should eyeball once) |
+| `require_human` | 6-8 | NVDA (position-type flip, never recommend-clear per §11), BRK.A (B-side ambiguous), GOOGL (no plausible evidence), JPM (judgement call on the short), BAC (merger needs human), 2 identifier_ambiguous rows |
 
-Exact split depends on what Claude decides on each run; the *shape* is what changed from a prior "everything escalates" behavior (the verdict-capture bug in `_extract_classification` is fixed; see `_default_escalate` in [code/agent.py](code/agent.py) for the safety fallback). `out/resolved_breaks.json` and `out/escalations.json` are the source of truth.
+Exact split depends on what Claude decides on each run; the *shape* is what changed from a prior "everything require_human" behavior (the disposition-capture bug in `_extract_classification` is fixed; see `_default_require_human` in [code/agent.py](code/agent.py) for the safety fallback). `out/agent_recommendations.json` and `out/human_review_queue.json` are the source of truth.
 
 ### Layer 3 — production architecture (roadmap)
 
@@ -350,7 +352,7 @@ Production lifts the same two-layer design into a fully managed, event-driven AW
 The line is sharp and load-bearing:
 
 - **Layer 1 is deterministic. It MUST NOT call an LLM.** Reconciling that 10,000 != -5,000 does not need a language model — it needs subtraction and a clear schema. Putting an LLM on that path adds latency, cost, an audit-trail headache, and a non-zero probability of arithmetic errors. The Layer-1 firewall makes the boundary mechanical, not aspirational.
-- **Layer 2 is where AI earns its seat.** Explaining *why* AAPL is off by 50,000 shares is the judgement-heavy job — pull the trade blotter, check settlement state, check corp actions, narrate a verdict with cited evidence. Classical software is bad at this; LLMs are good at it; and the audit trail (every tool call + every model response) is exactly the same shape regulators want anyway.
+- **Layer 2 is where AI earns its seat.** Explaining *why* AAPL is off by 50,000 shares is the judgement-heavy job — pull the trade blotter, check settlement state, check corp actions, narrate a disposition recommendation with cited evidence. Classical software is bad at this; LLMs are good at it; and the audit trail (every tool call + every model response) is exactly the same shape regulators want anyway.
 - **State changes stay out of the tool surface.** `update_book`, `move_position`, `process_payment` are not tools. The agent *recommends*; the system-of-record *acts*. Enforce at the tool boundary, not in the prompt.
 
 The strongest version of the demo is the Layer 1 / Layer 2 contrast, not the agent in isolation.
@@ -385,7 +387,7 @@ The 18-month row (DynamoDB, Step Functions, streaming feeds) is specified in [ar
 | Horizon | Investment | What ships | Break-volume target |
 |---|---|---|---|
 | **Today (this repo)** | One engineer, ~2 days | Layer 1 + Layer 2 prototype on laptops; mocked tools; demo-grade artifacts | N/A — proof of concept |
-| **6 months** | Small team | Layer 1 in CI; `get_recent_trades` and `lookup_corporate_actions` hit real internal APIs; `classify_break` runs against a labeled eval set; Bedrock AgentCore hosting; Slack approval flow | 50% reduction in human-touched breaks |
+| **6 months** | Small team | Layer 1 in CI; `get_recent_trades` and `lookup_corporate_actions` hit real internal APIs; `recommend_disposition` runs against a labeled eval set; Bedrock AgentCore hosting; Slack approval flow | 50% reduction in human-touched breaks |
 | **18 months** | Joint with custodian-relations | FIGI/ISIN/CUSIP master; streaming feeds from top-2 custodians; STP for in-house trades; DynamoDB + Step Functions production stack | 90%+ reduction in break volume |
 | **3 years** | Joint with industry | Standard identifiers + real-time across all custodians; agent handles only the long-tail exceptions; eval-driven auto-clear thresholds tuned per asset class | Residual-only; agent owns 100% of remaining exceptions |
 
@@ -427,13 +429,13 @@ Non-negotiables before any of this touches real positions:
 
 The bullets above promise an evaluation harness before auto-clear ever runs. That promise is empty without a contract. This subsection defines the contract — the *schema*, the *metric*, and the *bar* — so the harness becomes a build task in the 6-month roadmap rather than a research project.
 
-**Labeled-break schema.** A graded break is the `Break` record plus a human ground-truth verdict and minimal provenance:
+**Labeled-break schema.** A graded break is the `Break` record plus a human ground-truth disposition and minimal provenance:
 
 ```python
 class LabeledBreak(BaseModel):
     break_id: str                          # links back to the Break record
     break_snapshot: Break                  # full Break payload at label time
-    truth_verdict: Literal["auto_clear", "investigate", "escalate"]
+    truth_disposition: Literal["recommend_clear", "recommend_investigate", "require_human"]
     truth_root_cause: Literal[
         "settlement_timing", "corporate_action", "fx",
         "custodian_error", "data_quality", "real_difference",
@@ -449,15 +451,15 @@ Two non-obvious choices here: `break_snapshot` carries the *full* `Break` payloa
 
 **Metric — three numbers per release, computed per `break_type` and per `truth_root_cause`.**
 
-- **`precision_auto_clear`** = `correct_auto_clears / total_agent_auto_clears`. The *safety* number. False positives here are the regulatory risk — the agent auto-cleared a break that was actually a real difference and ops never saw it.
-- **`recall_escalate`** = `agent_escalations_on_true_escalates / total_true_escalates`. The *capture* number. False negatives here are the breaks that should have hit a human and didn't.
+- **`precision_recommend_clear`** = `correct_recommend_clears / total_agent_recommend_clears`. The *safety* number. False positives here are the regulatory risk — the agent recommended clear on a break that was actually a real difference and ops never saw it.
+- **`recall_require_human`** = `agent_require_human_on_true_human / total_true_human`. The *capture* number. False negatives here are the breaks that should have hit a human and didn't.
 - **`dollar_weighted_precision`** = `sum(dollar_impact of correct auto-clears) / sum(dollar_impact of all agent auto-clears)`. Catches the case where the agent is right on the small breaks and wrong on the big ones — a 95% raw precision can still be a 60% dollar-weighted precision if the misses cluster on the high-impact breaks.
 
-All three are cheap to compute from a `LabeledBreak` set; no instrumentation is needed beyond what the agent already emits to `out/resolved_breaks.json`.
+All three are cheap to compute from a `LabeledBreak` set; no instrumentation is needed beyond what the agent already emits to `out/agent_recommendations.json` and `out/human_review_queue.json`.
 
 **The bar — the actual auto-clear policy, written so ops, compliance, and engineering all read it the same way.**
 
-| `break_type` | `precision_auto_clear` floor | `dollar_weighted_precision` floor | Per-break dollar ceiling |
+| `break_type` | `precision_recommend_clear` floor | `dollar_weighted_precision` floor | Per-break dollar ceiling |
 |---|---|---|---|
 | `quantity_mismatch` | 0.99 | 0.99 | $10,000 |
 | `value_mismatch` | 0.99 | 0.99 | $10,000 |
@@ -465,11 +467,11 @@ All three are cheap to compute from a `LabeledBreak` set; no instrumentation is 
 | `missing_at_custodian` | 0.995 | 0.99 | $25,000 |
 | `identifier_ambiguous` | 1.00 | 1.00 | $0 (always escalate) |
 
-Two policy choices to defend: (1) `position_type_mismatch` and `identifier_ambiguous` are *never* auto-clearable — a direction flip and an unresolved identifier are categorically the wrong place for the agent to act, regardless of confidence. (2) The dollar ceilings above are deliberately conservative for the pilot; they ratchet up only after a documented N consecutive eval runs at the precision floor per `break_type`. No silent threshold creep.
+Two policy choices to defend: (1) `position_type_mismatch` and `identifier_ambiguous` are *never* `recommend_clear` — a direction flip and an unresolved identifier are categorically the wrong place for the agent to recommend clearing, regardless of confidence. (2) The dollar ceilings above are deliberately conservative for the pilot; they ratchet up only after a documented N consecutive eval runs at the precision floor per `break_type`. No silent threshold creep.
 
 **How the harness wires in (sketch — not built).** `code/eval/` holds a `LabeledBreak[]` JSON corpus (initial size ~50 records seeded from historical breaks; grows monotonically as ops grades real production breaks), a `run_eval.py` that replays each labeled snapshot through the Layer-2 agent with deterministic-mode prompting (`temperature=0`, fixed seed), and a `report.py` that writes a CSV per release with the three metrics → every `break_type` → every `truth_root_cause`. A single GitHub Actions job invokes the harness on every PR that touches `code/agent.py`, `code/tools/`, the system prompt, or the pinned model id, and the job fails if any cell in the per-release CSV is below the bar above — *no model change, no prompt change, no tool change ships without passing*. This is the gating mechanism referenced in the §9 6-month roadmap row, not a separate program.
 
-The agent's `escalate` verdict is the safe default. Any break with no classification, low confidence, or a tool-call failure falls into `out/escalations.json` rather than `out/resolved_breaks.json`.
+The agent's `require_human` disposition is the safe default. Any break with no recommendation, low confidence, or a tool-call failure falls into `out/human_review_queue.json` rather than `out/agent_recommendations.json`.
 
 ## How to Run
 
@@ -577,26 +579,26 @@ sequenceDiagram
         Tools-->>Agent: fixture evidence
         Agent->>Bedrock: tool results
         Bedrock-->>Agent: final reasoning
-        Agent->>Tools: classify_break verdict
+        Agent->>Tools: recommend_disposition
     end
-    Run-->>User: Layer2 summary resolved_breaks.json escalations.json
+    Run-->>User: Layer2 summary agent_recommendations.json human_review_queue.json
 ```
 
-### Tools and verdict routing
+### Tools and disposition routing
 
 | Tool | Source | Role |
 |---|---|---|
 | `lookup_security` | Real [`IdentifierResolver`](code/tools/securities.py) | Resolve ticker/description to `security_id` |
 | `get_recent_trades` | Mocked [`code/fixtures/trades.json`](code/fixtures/trades.json) | Settlement-timing evidence |
 | `lookup_corporate_actions` | Mocked [`code/fixtures/corporate_actions.json`](code/fixtures/corporate_actions.json) | Corp-action evidence |
-| `classify_break` | [`code/tools/classification.py`](code/tools/classification.py) | Records `auto_clear`, `investigate`, or `escalate` |
+| `recommend_disposition` | [`code/tools/recommendation.py`](code/tools/recommendation.py) | Records `recommend_clear`, `recommend_investigate`, or `require_human` |
 
 | Verdict | Written to |
 |---|---|
-| `auto_clear`, `investigate` | `out/resolved_breaks.json` |
-| `escalate` | `out/escalations.json` |
+| `recommend_clear`, `recommend_investigate` | `out/agent_recommendations.json` |
+| `require_human` | `out/human_review_queue.json` |
 
-If the agent never calls `classify_break`, the runner synthesizes an `escalate` verdict (safety fallback in [`code/agent.py`](code/agent.py)).
+If the agent never calls `recommend_disposition`, the runner synthesizes a `require_human` disposition (safety fallback in [`code/agent.py`](code/agent.py)).
 
 ### Example terminal output
 
@@ -616,39 +618,39 @@ Summary:
 runtime_seconds=0.032
 ```
 
-**ESCALATE → ambiguous identifier** (Alphabet; `lookup_security` cannot pick GOOGL vs GOOG):
+**require_human → ambiguous identifier** (Alphabet; `lookup_security` cannot pick GOOGL vs GOOG):
 
 ```text
 I'll investigate this identifier ambiguous break for Alphabet Inc...
 Tool #1: lookup_security
 ...
-Tool #2: classify_break
-**Verdict: ESCALATE**
+Tool #2: recommend_disposition
+**Disposition: require_human**
 ```
 
-**AUTO_CLEAR → settlement timing** (AAPL quantity mismatch; pending T+1 trade explains delta):
+**recommend_clear → settlement timing** (AAPL quantity mismatch; pending T+1 trade explains delta):
 
 ```text
 Tool #1: get_recent_trades
 Tool #2: lookup_corporate_actions
-Tool #3: classify_break
-**Verdict:** AUTO_CLEAR
+Tool #3: recommend_disposition
+**Disposition:** recommend_clear
 **Confidence:** 95%
 ```
 
-**ESCALATE → position type mismatch** (NVDA LONG vs SHORT; not auto-clearable per §11 policy):
+**require_human → position type mismatch** (NVDA LONG vs SHORT; never recommend_clear per §11 policy):
 
 ```text
-Tool #3: classify_break
-**Verdict: ESCALATE**
+Tool #3: recommend_disposition
+**Disposition: require_human**
 ```
 
 **Successful run tail** (not in sampleout; printed by [`code/run.py`](code/run.py) after all 15 breaks):
 
 ```text
 --- Layer 2 (agent) summary ---
-  auto_cleared_count: <n>
-  escalated_count: <n>
+  recommend_clear_count: <n>
+  human_review_count: <n>
   tokens_input: <n>
   tokens_output: <n>
   estimated_cost_usd: $0.xxxxxx

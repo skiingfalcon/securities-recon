@@ -17,13 +17,13 @@ flowchart TB
     end
 
     subgraph L2[Layer 2 - Agentic - Strands + Bedrock]
-        Agent[Agent_Runtime<br/>Claude Sonnet via BedrockModel<br/>tools: lookup, trades, corp_actions, classify]
+        Agent[Agent_Runtime<br/>Claude Sonnet via BedrockModel<br/>tools: lookup, trades, corp_actions, recommend]
         Cost[Cost_Reporter<br/>tokens + USD + runtime]
     end
 
     subgraph L2_Out[Layer 2 Outputs]
-        Resolved[out/resolved_breaks.json]
-        Esc[out/escalations.json]
+        Recs[out/agent_recommendations.json]
+        HITL[out/human_review_queue.json]
         Stdout[Run_Summary stdout<br/>'no book of record' line<br/>cost summary]
     end
 
@@ -37,8 +37,8 @@ flowchart TB
     Resolver --> DQ
 
     Raw -.-> Agent
-    Agent -.-> Resolved
-    Agent -.-> Esc
+    Agent -.-> Recs
+    Agent -.-> HITL
     Agent -.-> Cost
     Cost -.-> Stdout
     Reconciler --> Stdout
@@ -48,4 +48,4 @@ flowchart TB
     classDef io fill:#f0fff4,stroke:#2f855a
     class Ingest,Resolver,Reconciler l1
     class Agent,Cost l2
-    class CSV_A,CSV_B,CSV_M,Raw,DQ,Resolved,Esc,Stdout io
+    class CSV_A,CSV_B,CSV_M,Raw,DQ,Recs,HITL,Stdout io

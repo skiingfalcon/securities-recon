@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document specifies how the seven thought-leadership hooks in `requirements.md` are realized on top of the baseline two-layer reconciliation pipeline defined in #[[file:.kiro/steering/tech.md]]. Layer 1 — Ingest_Module, Identifier_Resolver, Reconciler — runs deterministically over the three CSVs in `GS-Technical-Case-Study/` and emits two JSON artifacts (`out/raw_breaks.json`, `out/data_quality.json`) wrapped in a `{metadata, data}` envelope. Layer 2 — Agent_Runtime, Cost_Reporter — consumes the raw break set, calls Strands `@tool` functions against Bedrock Claude Sonnet in `us-west-2`, and emits `out/resolved_breaks.json` and `out/escalations.json` with the same envelope plus a per-run cost summary. The hooks are scoped to keep Layer 1 LLM-free, to keep the Cost_Reporter degradable to Layer-1-only mode, and to fit inside the 80-LOC executable budget from Requirement 7.
+This document specifies how the seven thought-leadership hooks in `requirements.md` are realized on top of the baseline two-layer reconciliation pipeline defined in #[[file:.kiro/steering/tech.md]]. Layer 1 — Ingest_Module, Identifier_Resolver, Reconciler — runs deterministically over the three CSVs in `GS-Technical-Case-Study/` and emits two JSON artifacts (`out/raw_breaks.json`, `out/data_quality.json`) wrapped in a `{metadata, data}` envelope. Layer 2 — Agent_Runtime, Cost_Reporter — consumes the raw break set, calls Strands `@tool` functions against Bedrock Claude Sonnet in `us-west-2`, and emits `out/agent_recommendations.json` and `out/human_review_queue.json` with the same envelope plus a per-run cost summary. The hooks are scoped to keep Layer 1 LLM-free, to keep the Cost_Reporter degradable to Layer-1-only mode, and to fit inside the 80-LOC executable budget from Requirement 7.
 
 ## Architecture
 
@@ -33,8 +33,8 @@ flowchart TB
     end
 
     subgraph L2_Out[Layer 2 Outputs]
-        Resolved[out/resolved_breaks.json]
-        Esc[out/escalations.json]
+        Recs[out/agent_recommendations.json]
+        HITL[out/human_review_queue.json]
         Stdout[Run_Summary stdout<br/>'no book of record' line<br/>cost summary]
     end
 
@@ -105,7 +105,7 @@ Public interface:
 
 ### Agent_Runtime
 
-Lives in `code/agent.py` and is invoked from `code/run.py`. Constructs a Strands `Agent` with `BedrockModel(model_id="anthropic.claude-sonnet-4-..." , region_name="us-west-2")` and the `@tool` set listed in #[[file:.kiro/steering/tech.md]] (`lookup_security`, `get_recent_trades`, `get_corporate_actions`, `get_settlement_status`, `get_fx_rate`, `classify_break`, `propose_resolution`, `escalate_to_human`). Iterates over the raw break set; for each break, gives the agent the break record plus the security master row and asks it to produce a classified, explained Resolution. Captures token usage from each model response. Writes `out/resolved_breaks.json` and `out/escalations.json` through the same OutputArtifact envelope. Does not mutate inputs or call any state-changing surface.
+Lives in `code/agent.py` and is invoked from `code/run.py`. Constructs a Strands `Agent` with `BedrockModel(model_id="anthropic.claude-sonnet-4-..." , region_name="us-west-2")` and the `@tool` set listed in #[[file:.kiro/steering/tech.md]] (`lookup_security`, `get_recent_trades`, `get_corporate_actions`, `get_settlement_status`, `get_fx_rate`, `recommend_disposition` (demo); production also uses `classify_break`, `propose_resolution`, `escalate_to_human`). Iterates over the raw break set; for each break, gives the agent the break record plus the security master row and asks it to produce a classified, explained Resolution. Captures token usage from each model response. Writes `out/agent_recommendations.json` and `out/human_review_queue.json` through the same OutputArtifact envelope. Does not mutate inputs or call any state-changing surface.
 
 Public interface:
 
@@ -243,8 +243,8 @@ class RunSummary(BaseModel):
 
     total_breaks: int = Field(ge=0)
     breaks_by_type: dict[str, int] = Field(default_factory=dict)
-    auto_cleared_count: int | None = None              # None in Layer-1-only
-    escalated_count: int | None = None
+    recommend_clear_count: int | None = None           # None in Layer-1-only
+    human_review_count: int | None = None
     tokens_input: int | None = None
     tokens_output: int | None = None
     estimated_cost_usd: float | None = None
@@ -339,7 +339,7 @@ Every JSON artifact under `out/` shares the same envelope so a reviewer opening 
    - `as_of_date`: from CLI flag or default `2026-01-02`.
    - `generated_at`: `datetime.now(timezone.utc).isoformat()`.
 2. To write any artifact, build `OutputArtifact(metadata=cached_metadata, data=[record.model_dump(mode="json") for record in records])` and `json.dump(...)` it.
-3. Apply this envelope to `out/raw_breaks.json`, `out/data_quality.json`, `out/resolved_breaks.json`, and `out/escalations.json` (Requirement 5 AC 4). Do not invent additional artifacts in this design.
+3. Apply this envelope to `out/raw_breaks.json`, `out/data_quality.json`, `out/agent_recommendations.json`, and `out/human_review_queue.json` (Requirement 5 AC 4). Do not invent additional artifacts in this design.
 
 ### E. Cost computation and graceful degradation
 
@@ -364,8 +364,8 @@ The Cost_Reporter must run end-to-end whether or not Bedrock is reachable, and m
 |---|---|---|---|
 | `out/raw_breaks.json` | `OutputArtifact` with `data: list[Break]` | After Reconciler completes (Layer 1) | Req 5 AC 4; Req 4 AC 2, 3 |
 | `out/data_quality.json` | `OutputArtifact` with `data: list[IngestWarning]` grouped by source file then row index | After Ingest_Module + Identifier_Resolver complete (Layer 1) | Req 1 AC 7; Req 5 AC 4 |
-| `out/resolved_breaks.json` | `OutputArtifact` with `data: list[ResolvedBreak]` (Break enriched with classification, evidence, confidence, proposed_resolution per #[[file:.kiro/steering/product.md]]) | After Agent_Runtime completes (Layer 2 only) | Req 5 AC 4 |
-| `out/escalations.json` | `OutputArtifact` with `data: list[Escalation]` | When the agent's `escalate_to_human` tool fires (Layer 2 only) | Req 5 AC 4 |
+| `out/agent_recommendations.json` | `OutputArtifact` with `data: list[BreakRecommendation]` (`recommend_clear` / `recommend_investigate` dispositions) | After Agent_Runtime completes (Layer 2 only) | Req 5 AC 4 |
+| `out/human_review_queue.json` | `OutputArtifact` with `data: list[BreakRecommendation]` (`require_human` disposition) | When the agent routes a break to human review (Layer 2 only) | Req 5 AC 4 |
 | stdout: no-book-of-record line | Literal string per Req 4 AC 1 | First line of Run_Summary, every run | Req 4 AC 1, 4 |
 | stdout: cost summary | `RunSummary` fields per Req 6 AC 1 (full) or Req 6 AC 2 (layer1_only) | Last line(s) of Run_Summary | Req 6 (all) |
 
@@ -455,8 +455,8 @@ sequenceDiagram
         Bed-->>Ag: response + usage{input_tokens, output_tokens}
         Ag->>Cost: record_usage(input, output) or missing
     end
-    Ag->>Out: write resolved_breaks.json
-    Ag->>Out: write escalations.json
+    Ag->>Out: write agent_recommendations.json
+    Ag->>Out: write human_review_queue.json
 
     Run->>Sum: print_run_summary(...)
     Sum->>User: "No book of record was supplied;<br/>reconciling custodian_a vs custodian_b only."
@@ -464,7 +464,7 @@ sequenceDiagram
     opt missing_turns > 0
         Cost->>User: missing_token_usage warning line
     end
-    Cost->>User: total_breaks, auto_cleared, escalated,<br/>tokens_input, tokens_output,<br/>estimated_cost_usd, runtime_seconds
+    Cost->>User: total_breaks, recommend_clear, human_review,<br/>tokens_input, tokens_output,<br/>estimated_cost_usd, runtime_seconds
 ```
 
 When the user invokes Layer 1 only (`uv run python -m code.pipeline.reconcile`), steps 9 through 13 are skipped and Run_Summary calls Cost_Reporter in `layer1_only` mode (Req 6 AC 2). The no-book-of-record line is printed in both modes (Req 4 AC 1).

@@ -96,7 +96,7 @@ A real eval harness, mock-vs-real tool surface markers, and a Mermaid architectu
 1. THE Recon_Pipeline SHALL produce JSON output artifacts whose top-level structure is the object `{"metadata": {...}, "data": [...]}` where `data` holds the artifact's payload (for example, the list of Break records).
 2. THE `metadata` object SHALL contain the fields `ruleset_version` (semantic version string), `code_commit` (git short SHA or the literal string `"uncommitted"`), `input_file_sha256s` (object mapping each input filename to its hex-encoded SHA-256 digest), `as_of_date` (ISO 8601 date string), and `generated_at` (ISO 8601 timestamp with timezone offset).
 3. WHERE the working directory is not a git repository or the git short SHA cannot be determined, THE Recon_Pipeline SHALL set `code_commit` to the literal string `"uncommitted"` and continue without error.
-4. THE Recon_Pipeline SHALL apply the metadata-block format to every JSON artifact it writes to `out/`, including `out/raw_breaks.json`, `out/resolved_breaks.json`, `out/data_quality.json`, and `out/escalations.json`.
+4. THE Recon_Pipeline SHALL apply the metadata-block format to every JSON artifact it writes to `out/`, including `out/raw_breaks.json`, `out/agent_recommendations.json`, `out/data_quality.json`, and `out/human_review_queue.json`.
 5. THE Recon_Pipeline SHALL compute each entry of `input_file_sha256s` over the byte content of the corresponding input file as it was read for the run.
 
 ### Requirement 6: Run-end cost and token summary
@@ -105,7 +105,7 @@ A real eval harness, mock-vs-real tool surface markers, and a Mermaid architectu
 
 #### Acceptance Criteria
 
-1. WHEN the Agent_Runtime (Layer 2) completes a run, THE Cost_Reporter SHALL print to stdout a summary containing the fields `total_breaks` (integer), `auto_cleared_count` (integer), `escalated_count` (integer), `tokens_input` (integer), `tokens_output` (integer), `estimated_cost_usd` (float), and `runtime_seconds` (float).
+1. WHEN the Agent_Runtime (Layer 2) completes a run, THE Cost_Reporter SHALL print to stdout a summary containing the fields `total_breaks` (integer), `recommend_clear_count` (integer), `human_review_count` (integer), `tokens_input` (integer), `tokens_output` (integer), `estimated_cost_usd` (float), and `runtime_seconds` (float).
 2. WHEN the Recon_Pipeline runs Layer 1 only (Agent_Runtime is not invoked), THE Cost_Reporter SHALL print to stdout a summary containing `total_breaks` and `runtime_seconds`, omit the token and cost fields, and complete without raising an error.
 3. THE Cost_Reporter SHALL compute `estimated_cost_usd` as `(tokens_input / 1_000_000) * input_rate_usd_per_million + (tokens_output / 1_000_000) * output_rate_usd_per_million`, with both rate constants defined in source code and accompanied by an inline comment citing the Bedrock pricing source for the configured Claude Sonnet model.
 4. IF the Bedrock client response contains no token usage metadata for one or more turns, THEN THE Cost_Reporter SHALL set `tokens_input` and `tokens_output` for those turns to `0`, set the corresponding `estimated_cost_usd` contribution to `0.0`, and print a `missing_token_usage` warning line to stdout naming the affected turn count.

@@ -2,7 +2,7 @@
 # Requires AWS Bedrock access in us-west-2 for Claude Sonnet 4.5
 # (us.anthropic.claude-sonnet-4-5-20250929-v1:0). Truncated mid-run during
 # break 6 of 15; a full run prints the Layer 2 summary and writes
-# out/resolved_breaks.json and out/escalations.json.
+# out/agent_recommendations.json and out/human_review_queue.json.
 #
 (base) ➜  grayscale-project git:(main) uv run python -m code.run
 No book of record was supplied; reconciling custodian_a vs custodian_b only.
@@ -76,7 +76,7 @@ With a market value of $1,360,000 for 8,000 shares, the implied price is $170/sh
 This requires human intervention to:
 1. Contact custodian_b for clarification on which Alphabet share class is held
 2. Potentially cross-reference with other internal records or the original trade tickets
-Tool #2: classify_break
+Tool #2: recommend_disposition
 **Verdict: ESCALATE**
 
 This break requires human intervention. The security lookup tool confirmed that "Alphabet Inc" maps ambiguously to two securities (SEC0004 and SEC0005) with equal confidence, almost certainly representing Alphabet's Class A (GOOGL) and Class C (GOOG) shares. Without additional identifying information such as a ticker symbol, CUSIP, or explicit share class designation from custodian_b, it's impossible to determine which security the 8,000 shares represent. A human analyst should contact the custodian to obtain the specific share class before proceeding with reconciliation.I'll investigate this break. The issue is an ambiguous identifier - custodian_b provided a security description "Berkshire Hathaway Class A Inc" but no security_id was matched. Let me look up this security to see if I can resolve it.
@@ -92,7 +92,7 @@ Given that:
 2. The description mentions "Class A" but the system cannot definitively match it to a single security_id
 3. The position involves significant value ($6.5M) with a -10 share discrepancy
 4. Manual human review is needed to confirm the correct security mapping
-Tool #2: classify_break
+Tool #2: recommend_disposition
 **Verdict: ESCALATE**
 
 This break requires human intervention because the security description "Berkshire Hathaway Class A Inc" maps ambiguously to two different securities in the master (SEC0009 at 95% confidence and SEC0010 at 92% confidence). These are likely the Class A vs Class B shares, and while the description mentions "Class A", the system cannot definitively resolve which security_id to use for reconciliation. 
@@ -112,7 +112,7 @@ Perfect! I found the explanation for this quantity mismatch. The evidence shows:
 3. **Raw Source Data**: Shows 75,000 shares on trade date 01/02/2025 (likely a typo, should be 2026)
 
 This is a classic T+1 settlement timing issue. The trade was executed but not yet settled, causing one custodian to show the pre-trade quantity while the other (or the OMS) shows the post-trade quantity. The difference of 50,000 shares exactly matches the pending trade.
-Tool #3: classify_break
+Tool #3: recommend_disposition
 **Break Classification Complete**
 
 **Verdict:** AUTO_CLEAR  
@@ -132,7 +132,7 @@ Perfect! I found the evidence I need. Let me analyze:
 - The quantity mismatch is likely due to the timing difference: the trade was booked in the OMS on 01/02/2026 but hasn't settled at the custodian yet
 
 This is a classic T+1 settlement timing break. The custodian likely shows 15,000 shares (18,000 - 3,000) while the internal books show 18,000 shares because the trade has been booked but not yet settled.
-Tool #3: classify_break
+Tool #3: recommend_disposition
 **Verdict: AUTO_CLEAR** (Confidence: 95%)
 
 This break can be auto-cleared. The quantity mismatch of 3,000 shares is fully explained by a pending T+1 trade executed on the same day (2026-01-02). The trade has been booked in the order management system but hasn't yet settled at the custodian, which is standard for T+1 settlement cycles. This is a temporary timing difference that will self-resolve upon settlement.I'll investigate this position type mismatch break for SEC0003 (NVDA). Let me gather evidence by checking recent trades and corporate actions.
@@ -155,7 +155,7 @@ A position_type_mismatch means that one custodian or system is reporting this as
 3. The position has been held for a full year (trade date 01/02/2025 vs reconciliation date 2026-01-02)
 
 This type of break requires human review to determine which system has the correct position type classification, as it could indicate a booking error, system configuration issue, or legitimate but complex position structure (e.g., synthetic positions, hedges, or derivatives).
-Tool #3: classify_break
+Tool #3: recommend_disposition
 **Verdict: ESCALATE**
 
 I've classified this break as requiring escalation to human review with 85% confidence. A position_type_mismatch is a fundamental classification discrepancy that cannot be resolved through automated reconciliation tools. With no recent trades or corporate actions to explain the mismatch, and the position having existed for a full year, this requires manual investigation to determine which system has the correct position type and why the discrepancy exists.I'll investigate this break by looking up recent trades and corporate actions for SEC0004.
@@ -177,7 +177,7 @@ The absence of recent trades or corporate actions means there's no obvious settl
 4. An actual custody discrepancy requiring urgent attention
 
 This requires human review to verify the custodian's records and investigate the root cause.
-Tool #3: classify_break
+Tool #3: recommend_disposition
 **Verdict: ESCALATE**
 
 This break has been escalated for human review. The position showing in the source system (12,000 shares of GOOGL worth $2.04M) is completely missing from custodian_b, with no recent trading activity or corporate actions to explain the discrepancy. Given the material size of this position and the lack of any automatic explanation, this requires immediate attention from operations staff to verify custodian records and determine the root cause.I'll investigate this quantity mismatch for SEC0006 (AMZN) on 2026-01-02. Let me gather evidence by checking recent trades and corporate actions.
@@ -194,5 +194,5 @@ Perfect! I found key evidence:
 The 11,000 share purchase on trade date 2026-01-02 is still pending T+1 settlement, which means it would settle on 2026-01-03. This timing difference explains why one custodian (likely the OMS/trading book) shows the increased position including the pending trade, while the other custodian (likely the settlement/custody book) doesn't yet reflect it until settlement completes.
 
 If the pre-trade position was 4,000 shares, adding the pending 11,000 would give 15,000 shares at one custodian, while the other still shows 4,000.
-Tool #3: classify_break
+Tool #3: recommend_disposition
 **Verdict: AUTO_CLEAR** ✓

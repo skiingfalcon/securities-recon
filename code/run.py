@@ -31,8 +31,8 @@ def _estimate_cost_usd(tokens_input: int, tokens_output: int) -> float:
 
 
 def _print_layer2_summary(
-    auto_cleared: int,
-    escalated: int,
+    recommend_clear_count: int,
+    human_review_count: int,
     tokens_input: int,
     tokens_output: int,
     missing_turns: int,
@@ -50,8 +50,8 @@ def _print_layer2_summary(
             f"metadata; their cost is treated as $0.00"
         )
     print("--- Layer 2 (agent) summary ---")
-    print(f"  auto_cleared_count: {auto_cleared}")
-    print(f"  escalated_count: {escalated}")
+    print(f"  recommend_clear_count: {recommend_clear_count}")
+    print(f"  human_review_count: {human_review_count}")
     print(f"  tokens_input: {tokens_input}")
     print(f"  tokens_output: {tokens_output}")
     print(f"  estimated_cost_usd: ${_estimate_cost_usd(tokens_input, tokens_output):.6f}")
@@ -98,9 +98,12 @@ def main(project_root: Path | None = None) -> int:
         print(f"Layer 2 unavailable ({type(exc).__name__}: {exc}); running Layer-1-only.")
         return 0
 
+    recommend_clear = sum(
+        1 for r in agent_result.agent_recommendations if r["disposition"] == "recommend_clear"
+    )
     _print_layer2_summary(
-        auto_cleared=len(agent_result.resolved),
-        escalated=len(agent_result.escalations),
+        recommend_clear_count=recommend_clear,
+        human_review_count=len(agent_result.human_review),
         tokens_input=agent_result.tokens_input,
         tokens_output=agent_result.tokens_output,
         missing_turns=agent_result.missing_turns,

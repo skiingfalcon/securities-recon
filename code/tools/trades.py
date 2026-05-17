@@ -97,8 +97,8 @@ _RECENT_TRADES: dict[str, list[dict]] = {
         },
     ],
     # Deliberately empty: SEC0003 (NVDA position_type_mismatch — §11
-    # never auto-clearable), SEC0009 (BRK.A — B-side ambiguous, escalate),
-    # SEC0004 (GOOGL — no plausible settlement story, escalate),
+    # never recommend_clear), SEC0009 (BRK.A — B-side ambiguous, require_human),
+    # SEC0004 (GOOGL — no plausible settlement story, require_human),
     # SEC0014 (BAC — corp-actions tool carries the explanation, see
     # corporate_actions.py).
 }
